@@ -1,8 +1,8 @@
-torch
+torch>=1.10.0
 transformers>=4.30.0
 bitsandbytes>=0.40.0
-pandas
-scikit-learn
-tqdm
-datasets
-accelerate
+pandas>=1.3.0
+scikit-learn>=1.0.0
+tqdm>=4.62.0
+datasets>=2.0.0
+accelerate>=0.12.0

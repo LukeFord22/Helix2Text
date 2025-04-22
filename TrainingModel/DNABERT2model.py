@@ -53,7 +53,7 @@ SEMANTIC_LOSS_WEIGHT = 0.5
 #                                                                                        Dataset Loading
 #======================================================================================================= 
 
-df = pd.read_csv("ncbi_search.csv")
+df = pd.read_csv("protein_to_dna_sequence_descriptions.csv")
 
 sampled_df = df.sample(frac=TRAIN_DATA_FRACTION, random_state=42)
 train_df = sampled_df.sample(frac=0.9, random_state=42)
