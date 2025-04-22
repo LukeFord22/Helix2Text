@@ -5,12 +5,11 @@ from sklearn.metrics import f1_score
 from torch.utils.data import DataLoader
 from datasets import Dataset, DatasetDict
 from transformers import AutoTokenizer, GPT2LMHeadModel, AutoModelForCausalLM, BitsAndBytesConfig
-
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch.nn import CrossEntropyLoss, CosineEmbeddingLoss
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
-
+from transformers import GPT2Config
 
 #=======================================================================================================
 #                                                                                         Model loading
@@ -37,7 +36,17 @@ dna_model = AutoModelForCausalLM.from_pretrained(
 #== Distill GPT2 Model ==
 text_model_path = "distilgpt2"
 text_tokenizer = AutoTokenizer.from_pretrained(text_model_path, trust_remote_code=True)
-text_model = GPT2LMHeadModel.from_pretrained(text_model_path, trust_remote_code=True).to(device)
+
+# Import and use GPT2Config to enable cross-attention
+text_config = GPT2Config.from_pretrained(text_model_path)
+text_config.add_cross_attention = True  # Enable cross-attention
+
+# Load the model with the modified config
+text_model = GPT2LMHeadModel.from_pretrained(
+    text_model_path, 
+    config=text_config,
+    trust_remote_code=True
+).to(device)
 
 if text_tokenizer.pad_token is None:
     text_tokenizer.pad_token = text_tokenizer.eos_token
@@ -105,6 +114,8 @@ test_loader = DataLoader(tokenized_data['test'], batch_size=BATCH_SIZE, pin_memo
 #=======================================================================================================
 #                                                                                     Model Architecture
 #=======================================================================================================
+import os
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Fusion Model
 class DNATextFusion(nn.Module):
@@ -120,46 +131,96 @@ class DNATextFusion(nn.Module):
             use_cache=False
         )
         return outputs.hidden_states[-1]
+    
+    def generate_text_from_dna(self, dna_inputs, max_length=512, num_beams=4):
+        """
+        Generate text from DNA inputs using the fusion model's text generation capabilities.
+        
+        Args:
+            dna_inputs: Dictionary with DNA input_ids and attention_mask
+            max_length: Maximum length of generated text
+            num_beams: Number of beams for beam search
+            
+        Returns:
+            Generated text token IDs
+        """
+        # Get encoder-style hidden states from DNA model
+        dna_hidden = self.get_decoder_hidden_states(
+            self.dna_model,
+            dna_inputs["input_ids"],
+            dna_inputs["attention_mask"]
+        )
+        
+        # Project DNA hidden states to text space
+        projected_dna = self.dna_to_text_proj(dna_hidden.to(self.dna_to_text_proj.weight.dtype))
+        
+        # Generate text using the text model with projected DNA as conditioning
+        generated_ids = self.text_model.generate(
+            input_ids=dna_inputs["input_ids"][:, :1],  # Just use first token or BOS token
+            encoder_hidden_states=projected_dna,
+            encoder_attention_mask=dna_inputs["attention_mask"],
+            max_length=max_length,
+            num_beams=num_beams,
+            early_stopping=True
+        )
+        
+        return generated_ids
 
-    def __init__(self, dna_model, text_model, hidden_size=768):
+    def __init__(self, dna_model, text_model):
         super(DNATextFusion, self).__init__()
         
         # DNA and Text Models
-        self.dna_model = dna_model  # Use the full DNA model
-        self.text_model = text_model  # Use the full Text model
+        self.dna_model = dna_model
+        self.text_model = text_model
 
-        # Project DNA model outputs to match the Text model's input size
-        self.dna_to_text_proj = nn.Linear(hidden_size, self.text_model.config.n_embd)
+        # Dynamically retrieve the hidden sizes
+        dna_hidden_size = dna_model.config.hidden_size
+        text_hidden_size = text_model.config.n_embd
+
+        # Separate projection layers for DNA and Text hidden states
+        self.dna_to_text_proj = nn.Linear(dna_hidden_size, text_hidden_size)
+        self.text_to_dna_proj = nn.Linear(text_hidden_size, dna_hidden_size)
 
     def forward(self, dna_inputs, text_inputs, attention_mask=None):
         # Get encoder-style hidden states from decoder-only models
         dna_hidden = self.get_decoder_hidden_states(
-            self.dna_model,  # Use dna_model instead of dna_decoder
+            self.dna_model,
             dna_inputs["input_ids"],
             dna_inputs["attention_mask"]
         )
 
         text_hidden = self.get_decoder_hidden_states(
-            self.text_model,  # Use text_model instead of text_decoder
+            self.text_model,
             text_inputs["input_ids"],
             text_inputs["attention_mask"]
         )
 
-        # Project for compatibility
-        projected_dna = self.dna_to_text_proj(dna_hidden)
-        projected_text = self.dna_to_text_proj(text_hidden)
+        # Use separate projection layers for compatibility
+        projected_dna = self.dna_to_text_proj(dna_hidden.to(self.dna_to_text_proj.weight.dtype))
+        projected_text = self.text_to_dna_proj(text_hidden.to(self.text_to_dna_proj.weight.dtype))
 
-        # DNA-from-Text decoding
+        # Print vocabulary information for debugging
+        print("DNA Input max ID:", dna_inputs["input_ids"].max().item())
+        print("DNA Vocab size:", self.dna_model.config.vocab_size)
+        print("Text Input max ID:", text_inputs["input_ids"].max().item())
+        print("Text Vocab size:", self.text_model.config.vocab_size)
+
+        # Create safe input IDs for cross-model use
+        # Clamp values to be within each model's vocabulary range
+        safe_dna_ids = torch.clamp(dna_inputs["input_ids"], 0, self.dna_model.config.vocab_size - 1)
+        safe_text_ids = torch.clamp(text_inputs["input_ids"], 0, self.text_model.config.vocab_size - 1)
+        
+        # DNA-from-Text decoding - use DNA's own token IDs for input_ids
         dna_decoder_outputs = self.dna_model(
-            input_ids=text_inputs["input_ids"],  # Generate DNA from text
+            input_ids=safe_dna_ids,  # Use DNA's own safe IDs
             encoder_hidden_states=projected_text,
             encoder_attention_mask=text_inputs["attention_mask"],
             attention_mask=attention_mask,
         )
 
-        # Text-from-DNA decoding
+        # Text-from-DNA decoding - use Text's own token IDs for input_ids
         text_decoder_outputs = self.text_model(
-            input_ids=dna_inputs["input_ids"],  # Generate text from DNA
+            input_ids=safe_text_ids,  # Use Text's own safe IDs
             encoder_hidden_states=projected_dna,
             encoder_attention_mask=dna_inputs["attention_mask"],
             attention_mask=attention_mask,
@@ -169,24 +230,6 @@ class DNATextFusion(nn.Module):
             "dna_logits": dna_decoder_outputs.logits,
             "text_logits": text_decoder_outputs.logits
         }
-
-    def generate_dna_from_text(self, text_inputs, attention_mask=None):
-        # Generate DNA from Text
-        text_outputs = self.text_model.generate(  # Use self.text_model instead of self.text_decoder
-            input_ids=text_inputs["input_ids"],
-            attention_mask=text_inputs["attention_mask"],
-            max_new_tokens=50  # Define max length for DNA generation
-        )
-        return text_outputs
-
-    def generate_text_from_dna(self, dna_inputs, attention_mask=None):
-        # Generate Text from DNA
-        dna_outputs = self.dna_model.generate(  # Use self.dna_model instead of self.dna_decoder
-            input_ids=dna_inputs["input_ids"],
-            attention_mask=dna_inputs["attention_mask"],
-            max_new_tokens=50  # Define max length for Text generation
-        )
-        return dna_outputs
 
 
 model = DNATextFusion(dna_model=dna_model, text_model=text_model).to(device)
@@ -251,6 +294,17 @@ for epoch in range(NUM_EPOCHS):
             "input_ids": batch["text_input_ids"].to(device),
             "attention_mask": batch["text_attention_mask"].to(device),
         }
+
+        # 🔥 🔒 Safety first: catch any rogue tokens before CUDA meltdown
+        assert dna_inputs["input_ids"].max().item() < dna_model.config.vocab_size, \
+            f"OOV token in dna_inputs: {dna_inputs['input_ids'].max().item()}"
+        assert text_inputs["input_ids"].max().item() < text_model.config.vocab_size, \
+            f"OOV token in text_inputs: {text_inputs['input_ids'].max().item()}"
+
+        # Then move to device
+        dna_inputs = {k: v.to(device) for k, v in dna_inputs.items()}
+        text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
+
 
         # Text → DNA prediction (exact match)
         dna_labels = batch["dna_input_ids"].to(device)  # shape: (B, L)
