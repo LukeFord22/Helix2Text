@@ -1,3 +1,5 @@
+import os
+import requests
 import torch
 import pandas as pd
 import torch.nn as nn
@@ -74,7 +76,30 @@ SEMANTIC_LOSS_WEIGHT = 0.5
 #                                                                                        Dataset Loading
 #======================================================================================================= 
 
-df = pd.read_csv("protein_to_dna_sequence_descriptions.csv")
+def download_dataset(url, save_path):
+    """Download the dataset if it doesn't exist locally."""
+    if not os.path.exists(save_path):
+        print(f"Downloading dataset to {save_path}...")
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print("Download complete!")
+    else:
+        print(f"Dataset already exists at {save_path}")
+
+# GitHub release asset URL
+dataset_url = "https://github.com/LukeFord22/Helix2Text/releases/download/v0.1-data/protein_to_dna_sequence_descriptions.csv"
+local_path = "protein_to_dna_sequence_descriptions.csv"
+
+# Download if needed
+download_dataset(dataset_url, local_path)
+
+# Load the data
+df = pd.read_csv(local_path)
 
 sampled_df = df.sample(frac=TRAIN_DATA_FRACTION, random_state=42)
 train_df = sampled_df.sample(frac=0.9, random_state=42)
@@ -87,7 +112,7 @@ dataset = DatasetDict({
 
 def tokenize_fn(example):
     dna_enc = dna_tokenizer(
-        example["sequence"], 
+        example["DNA_Sequence"], 
         truncation=True, padding="max_length", max_length=MAX_SEQ_LENGTH
     )
     text_enc = text_tokenizer(
@@ -114,7 +139,7 @@ test_loader = DataLoader(tokenized_data['test'], batch_size=BATCH_SIZE, pin_memo
 #=======================================================================================================
 #                                                                                     Model Architecture
 #=======================================================================================================
-import os
+
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 # Fusion Model

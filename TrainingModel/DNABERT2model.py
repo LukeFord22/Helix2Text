@@ -1,13 +1,83 @@
+import os
 import torch
 import pandas as pd
+from tqdm import tqdm
 import torch.nn as nn
-from sklearn.metrics import f1_score
+from time import time
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from datasets import Dataset, DatasetDict
-from transformers import AutoTokenizer, AutoModel, BertConfig, GPT2LMHeadModel
+from transformers import AutoTokenizer, AutoModel, BertConfig, AutoModelForCausalLM
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch.nn import CrossEntropyLoss, CosineEmbeddingLoss
-from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from rouge_score import rouge_scorer
+import random
+import wandb
+
+#=======================================================================================================
+#                                                                                   Adjustable Parameters
+#=======================================================================================================
+torch.autograd.set_detect_anomaly(True)
+
+# Add early stopping parameters
+EARLY_STOP_PATIENCE = 5
+BEST_VALUE = 0
+
+#Run parameters
+BATCH_SIZE = 2
+NUM_EPOCHS = 3
+LEARNING_RATE = 3e-5
+MAX_SEQ_LENGTH = 32
+GRAD_ACCUM_STEPS = 4
+TRAIN_DATA_FRACTION = 0.1
+SEMANTIC_LOSS_WEIGHT = 0.5
+FROZEN_LAYERS = 24
+#=======================================================================================================
+#                                                                                        Dataset Loading
+#======================================================================================================= 
+
+df = pd.read_csv(os.path.join(os.path.dirname(__file__), "protein_to_dna_sequence_descriptions.csv"))
+
+sampled_df = df.sample(frac=TRAIN_DATA_FRACTION, random_state=42)
+train_df = sampled_df.sample(frac=0.9, random_state=42)
+test_df = sampled_df.drop(train_df.index)
+
+dataset = DatasetDict({
+    "train": Dataset.from_pandas(train_df),
+    "test": Dataset.from_pandas(test_df)
+})
+
+def tokenize_fn(example):
+    dna_enc = dna_tokenizer(
+        example["DNA_Sequence"], 
+        truncation=True, padding="max_length", max_length=MAX_SEQ_LENGTH
+    )
+    text_enc = text_tokenizer(
+        example["text"], 
+        truncation=True, padding="max_length", max_length=MAX_SEQ_LENGTH
+    )
+    
+    # For training, we need the DNA tokens as both input and labels
+    # Copy the input IDs as labels for predicting DNA sequence
+    dna_labels = dna_enc["input_ids"].copy()
+    
+    return {
+        "dna_input_ids": dna_enc["input_ids"],
+        "dna_attention_mask": dna_enc["attention_mask"],
+        "text_input_ids": text_enc["input_ids"],
+        "text_attention_mask": text_enc["attention_mask"],
+        "dna_labels": dna_labels, 
+    }
+
+tokenized_data = dataset.map(tokenize_fn, batched=True)
+tokenized_data.set_format("torch")
+
+sample_data = tokenized_data['train'].select(range(10))
+sample_df = pd.DataFrame(sample_data)
+
+train_loader = DataLoader(tokenized_data['train'], batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
+test_loader = DataLoader(tokenized_data['test'], batch_size=BATCH_SIZE, pin_memory=True)
 
 
 #=======================================================================================================
@@ -22,72 +92,25 @@ config = BertConfig.from_pretrained(dna_model_path)
 dna_model = AutoModel.from_pretrained(dna_model_path, config=config, trust_remote_code=True).to(device)
 
 
-#== Distill GPT2 Model ==
-text_model_path = "distilgpt2"
+#== BioGPT Model ==
+text_model_path = "microsoft/biogpt-large-pubmedqa"
 text_tokenizer = AutoTokenizer.from_pretrained(text_model_path, trust_remote_code=True)
-text_model = GPT2LMHeadModel.from_pretrained(text_model_path, trust_remote_code=True).to(device)
-
 if text_tokenizer.pad_token is None:
     text_tokenizer.pad_token = text_tokenizer.eos_token
+    text_tokenizer.pad_token_id = text_tokenizer.eos_token_id
+text_tokenizer.padding_side = 'left'
+text_model = AutoModelForCausalLM.from_pretrained(
+    text_model_path, 
+    trust_remote_code=True,
+    pad_token_id=text_tokenizer.eos_token_id
+).to(device)
 
-#=======================================================================================================
-#                                                                                   Adjustable Parameters
-#=======================================================================================================
-torch.autograd.set_detect_anomaly(True)
-
-# Add early stopping parameters
-EARLY_STOP_PATIENCE = 3
-best_val_f1 = 0.3
-epochs_no_improve = 3
-
-#Run parameters
-BATCH_SIZE = 4
-NUM_EPOCHS = 8
-LEARNING_RATE = 3e-5
-MAX_SEQ_LENGTH = 512
-GRAD_ACCUM_STEPS = 4
-TRAIN_DATA_FRACTION = 1
-SEMANTIC_LOSS_WEIGHT = 0.5
-
-#=======================================================================================================
-#                                                                                        Dataset Loading
-#======================================================================================================= 
-
-df = pd.read_csv("protein_to_dna_sequence_descriptions.csv")
-
-sampled_df = df.sample(frac=TRAIN_DATA_FRACTION, random_state=42)
-train_df = sampled_df.sample(frac=0.9, random_state=42)
-test_df = sampled_df.drop(train_df.index)
-
-dataset = DatasetDict({
-    "train": Dataset.from_pandas(train_df),
-    "test": Dataset.from_pandas(test_df)
-})
-
-def tokenize_fn(example):
-    dna_enc = dna_tokenizer(
-        example["sequence"], 
-        truncation=True, padding="max_length", max_length=MAX_SEQ_LENGTH
-    )
-    text_enc = text_tokenizer(
-        example["text"], 
-        truncation=True, padding="max_length", max_length=MAX_SEQ_LENGTH
-    )
-    return {
-        "dna_input_ids": dna_enc["input_ids"],
-        "dna_attention_mask": dna_enc["attention_mask"],
-        "text_input_ids": text_enc["input_ids"],
-        "text_attention_mask": text_enc["attention_mask"],
-    }
-
-tokenized_data = dataset.map(tokenize_fn, batched=True)
-tokenized_data.set_format("torch")
-
-sample_data = tokenized_data['train'].select(range(10))
-sample_df = pd.DataFrame(sample_data)
-
-train_loader = DataLoader(tokenized_data['train'], batch_size=BATCH_SIZE, shuffle=True, pin_memory=True)
-test_loader = DataLoader(tokenized_data['test'], batch_size=BATCH_SIZE, pin_memory=True)
+def freeze_gpt_layers(model, num_layers_to_freeze=FROZEN_LAYERS):
+    for i, block in enumerate(model.gpt_cross.gpt.transformer.h):
+        if i < num_layers_to_freeze:
+            for param in block.parameters():
+                param.requires_grad = False
+    print(f"✅ Frozen GPT-2 layers: 0 through {num_layers_to_freeze - 1}")
 
 
 #=======================================================================================================
@@ -95,78 +118,151 @@ test_loader = DataLoader(tokenized_data['test'], batch_size=BATCH_SIZE, pin_memo
 #=======================================================================================================
 
 # Fusion Model
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, hidden_size, cross_hidden_size, n_heads=8):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_size,
+            kdim=cross_hidden_size,
+            vdim=cross_hidden_size,
+            num_heads=n_heads,
+            batch_first=True
+        )
+        self.gate = nn.Parameter(torch.ones(1))  
+        self.norm = nn.LayerNorm(hidden_size)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x, context, context_mask=None):
+        key_padding_mask = None
+        if context_mask is not None:
+            key_padding_mask = ~context_mask.bool()
+
+        attn_output, _ = self.cross_attn(x, context, context, key_padding_mask=key_padding_mask)
+        gated_output = self.gate * attn_output
+        return self.norm(x + self.dropout(gated_output))
+
+
+class GPTWithCrossAttention(nn.Module):
+    def __init__(self, gpt_model, cross_hidden_size, insert_every_n=4):
+        super().__init__()
+        self.gpt = gpt_model
+        
+        # BioGPT uses a slightly different architecture
+        # Access the transformer blocks correctly
+        self.transformer_blocks = gpt_model.model.layers
+        
+        self.cross_attention_blocks = nn.ModuleList([
+            CrossAttentionBlock(
+                hidden_size=gpt_model.config.hidden_size,  # Use hidden_size instead of n_embd
+                cross_hidden_size=cross_hidden_size,
+                n_heads=gpt_model.config.num_attention_heads  # Use num_attention_heads
+            ) for _ in range(len(self.transformer_blocks))
+        ])
+        self.insert_every_n = insert_every_n
+        
+        # Get the appropriate embedding layers
+        self.wte = gpt_model.model.embed_tokens
+        # May not have position embeddings in same way
+        self.has_position_embedding = hasattr(gpt_model.model, 'embed_positions')
+        if self.has_position_embedding:
+            self.wpe = gpt_model.model.embed_positions
+            
+        # Final layer norm and output projection
+        self.ln_f = gpt_model.model.norm
+        self.lm_head = gpt_model.lm_head
+
+    def forward(self, input_ids, attention_mask, dna_context, dna_mask=None):
+        B, L = input_ids.shape
+        
+        # Handle embeddings differently for BioGPT
+        hidden_states = self.wte(input_ids)
+        
+        # Add position embeddings if available
+        if self.has_position_embedding:
+            position_ids = self.wpe.make_positions(input_ids)
+            hidden_states = hidden_states + self.wpe(position_ids)
+        
+        # Process through layers with cross-attention
+        for i, block in enumerate(self.transformer_blocks):
+            # For BioGPT, we need to pass attention mask differently
+            hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+            if i % self.insert_every_n == 0:
+                hidden_states = self.cross_attention_blocks[i](hidden_states, dna_context, dna_mask)
+
+        hidden_states = self.ln_f(hidden_states)
+        return self.lm_head(hidden_states), hidden_states
+
+
 class DNATextFusion(nn.Module):
-    def __init__(self, dna_model, text_model, hidden_size=768):
-        super(DNATextFusion, self).__init__()
-        
-        # Shared Encoder (e.g., T5, BERT)
-        self.encoder = dna_model.encoder  # Shared encoder
-        
-        # DNA and Text Decoders
-        self.dna_decoder = dna_model.decoder  # Decoder for DNA generation
-        self.text_decoder = text_model.decoder  # Decoder for Text generation
-
-        # Project encoder outputs to match the decoder's input size
-        self.encoder_to_decoder_proj = nn.Linear(hidden_size, self.dna_decoder.config.d_model)
-
-    def forward(self, dna_inputs, text_inputs, attention_mask=None):
-        # Encoder (shared for both DNA and Text)
-        # Process DNA sequence through the encoder
-        dna_outputs = self.encoder(input_ids=dna_inputs["input_ids"], attention_mask=dna_inputs["attention_mask"])
-        dna_hidden_states = dna_outputs.last_hidden_state  # (batch_size, seq_len, hidden_size)
-
-        # Process Text sequence through the encoder
-        text_outputs = self.encoder(input_ids=text_inputs["input_ids"], attention_mask=text_inputs["attention_mask"])
-        text_hidden_states = text_outputs.last_hidden_state  # (batch_size, seq_len, hidden_size)
-
-        # Project encoder hidden states to match the decoder's hidden size (if needed)
-        projected_dna_hidden = self.encoder_to_decoder_proj(dna_hidden_states)
-        projected_text_hidden = self.encoder_to_decoder_proj(text_hidden_states)
-
-        # Decoder for DNA from Text (Text to DNA generation)
-        # Cross-attention on DNA decoder
-        dna_decoder_outputs = self.dna_decoder(
-            input_ids=text_inputs["input_ids"],  # Text input is used here
-            encoder_hidden_states=projected_text_hidden,
-            encoder_attention_mask=text_inputs["attention_mask"],
-            attention_mask=attention_mask
+    def __init__(self, dna_encoder, gpt_model, hidden_size=768):
+        super().__init__()
+        self.dna_encoder = dna_encoder
+        self.dna_cls = nn.Parameter(torch.randn(1, 1, hidden_size))
+        self.gpt_cross = GPTWithCrossAttention(
+            gpt_model=gpt_model,
+            cross_hidden_size=hidden_size
+        )
+        self.dna_proj = nn.Sequential(
+            nn.Linear(hidden_size, gpt_model.config.n_embd),
+            nn.LayerNorm(gpt_model.config.n_embd)
         )
 
-        # Decoder for Text from DNA (DNA to Text generation)
-        # Cross-attention on Text decoder
-        text_decoder_outputs = self.text_decoder(
-            input_ids=dna_inputs["input_ids"],  # DNA input is used here
-            encoder_hidden_states=projected_dna_hidden,
-            encoder_attention_mask=dna_inputs["attention_mask"],
-            attention_mask=attention_mask
+        self.bos_token_id = gpt_model.config.bos_token_id
+        self.eos_token_id = gpt_model.config.eos_token_id
+
+    def encode_dna(self, dna_inputs):
+        dna_out = self.dna_encoder(
+            input_ids=dna_inputs["input_ids"],
+            attention_mask=dna_inputs["attention_mask"]
         )
+        dna_context = dna_out[0] if isinstance(dna_out, tuple) else dna_out.last_hidden_state
+        cls_token = self.dna_cls.expand(dna_context.size(0), -1, -1)
+        dna_context = torch.cat([cls_token, dna_context], dim=1)
+        return self.dna_proj(dna_context)
 
-        # Output the logits for both DNA and Text
-        return {
-            "dna_logits": dna_decoder_outputs.logits,  # Logits for DNA prediction
-            "text_logits": text_decoder_outputs.logits   # Logits for Text prediction
-        }
-
-    def generate_dna_from_text(self, text_inputs, attention_mask=None):
-        # Generate DNA from Text
-        text_outputs = self.text_decoder.generate(
+    def forward(self, dna_inputs, text_inputs):
+        dna_context = self.encode_dna(dna_inputs)
+        logits, text_hidden = self.gpt_cross(
             input_ids=text_inputs["input_ids"],
             attention_mask=text_inputs["attention_mask"],
-            max_length=128  # Define max length for DNA generation
+            dna_context=dna_context,
+            dna_mask=None  # if used: adjust mask to account for CLS token
         )
-        return text_outputs
+        return {"text_logits": logits, "text_hidden": text_hidden}
 
-    def generate_text_from_dna(self, dna_inputs, attention_mask=None):
-        # Generate Text from DNA
-        dna_outputs = self.dna_decoder.generate(
-            input_ids=dna_inputs["input_ids"],
-            attention_mask=dna_inputs["attention_mask"],
-            max_length=128  # Define max length for Text generation
-        )
-        return dna_outputs
+    def generate_text_from_dna(self, dna_inputs, max_length=128, temperature=0.7):
+        with torch.no_grad():
+            dna_context = self.encode_dna(dna_inputs)
+            input_ids = torch.full(
+                (dna_inputs["input_ids"].size(0), 1),
+                text_tokenizer.bos_token_id if text_tokenizer.bos_token_id else text_tokenizer.eos_token_id,
+                dtype=torch.long,
+                device=dna_inputs["input_ids"].device
+            )
+            
+            # Use temperature sampling instead of argmax
+            for _ in range(max_length):
+                logits, _ = self.gpt_cross(
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids),
+                    dna_context=dna_context,
+                    dna_mask=None
+                )
+                # Apply temperature and sample
+                probs = F.softmax(logits[:, -1, :] / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                input_ids = torch.cat([input_ids, next_token], dim=1)
+                
+                # Optional: Stop if EOS token is generated
+                if (next_token == text_tokenizer.eos_token_id).all():
+                    break
+                    
+            return input_ids
 
 
-model = DNATextFusion(dna_model=dna_model, text_model=text_model).to(device)
+
+model = DNATextFusion(dna_encoder=dna_model, gpt_model=text_model).to(device)
+freeze_gpt_layers(model, num_layers_to_freeze=3)
 
 #== optimizer ==
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
@@ -177,49 +273,123 @@ warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_i
 cosine_scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warmup_steps)
 scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
+
 #=======================================================================================================
 #                                                                                            Evaluation
 #=======================================================================================================
 
-def evaluate(model, dataloader):
+def evaluate(model, dataloader, tokenizer, device, show_examples=5, current_epoch=None):
     model.eval()
-    all_preds, all_labels = [], []
+    all_preds, all_refs = [], []
+    example_pairs = []  # Collect examples here first
+
     with torch.no_grad():
         for batch in dataloader:
             dna_inputs = {
                 "input_ids": batch["dna_input_ids"].to(device),
                 "attention_mask": batch["dna_attention_mask"].to(device),
             }
-            text_inputs = {
-                "input_ids": batch["text_input_ids"].to(device),
-                "attention_mask": batch["text_attention_mask"].to(device),
-            }
-            labels = batch["label"].to(device)
+            true_texts = batch["text_input_ids"]
 
-            outputs = model(dna_inputs, text_inputs)
-            preds = outputs.argmax(dim=-1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            # Generate
+            generated_ids = model.generate_text_from_dna(dna_inputs, max_length=tokenizer.model_max_length)
+            generated_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+            reference_texts = tokenizer.batch_decode(true_texts, skip_special_tokens=True)
 
-    return f1_score(all_labels, all_preds, average="macro")
+            all_preds.extend(generated_texts)
+            all_refs.extend(reference_texts)
+            
+            # Just store examples for now, don't log yet
+            example_pairs.extend(list(zip(reference_texts, generated_texts)))
+            
+            # Stop collecting if we have enough examples
+            if len(example_pairs) >= show_examples * 2:
+                break
+
+    # Create one table with a random sample of examples after all evaluation is done
+    sample_table = wandb.Table(columns=["Reference", "Prediction"])
+    
+    # Take a random sample of the collected examples
+    for ref, pred in random.sample(example_pairs, k=min(show_examples, len(example_pairs))):
+        sample_table.add_data(ref, pred)
+        
+    # Log just once with a unique name per epoch
+    epoch_name = f"epoch_{current_epoch}" if current_epoch is not None else f"epoch_unknown"
+    wandb.log({f"eval_examples/{epoch_name}": sample_table})
+
+    # BLEU or other metrics
+    from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+    smoothie = SmoothingFunction().method4
+    bleu_scores = [sentence_bleu([ref.split()], pred.split(), smoothing_function=smoothie)
+                   for ref, pred in zip(all_refs, all_preds)]
+    avg_bleu = sum(bleu_scores) / len(bleu_scores)
+
+    scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+    rouge_scores = [scorer.score(ref, pred) for ref, pred in zip(all_refs, all_preds)]
+    
+    avg_rouge1 = sum(score['rouge1'].fmeasure for score in rouge_scores) / len(rouge_scores)
+    avg_rouge2 = sum(score['rouge2'].fmeasure for score in rouge_scores) / len(rouge_scores)
+    avg_rougeL = sum(score['rougeL'].fmeasure for score in rouge_scores) / len(rouge_scores)
+    
+    wandb.log({
+        f"rouge1/epoch_{current_epoch}": avg_rouge1,
+        f"rouge2/epoch_{current_epoch}": avg_rouge2,
+        f"rougeL/epoch_{current_epoch}": avg_rougeL
+    })
+    
+    print(f"🧠 Evaluation Scores - BLEU: {avg_bleu:.4f}, ROUGE-1: {avg_rouge1:.4f}, ROUGE-L: {avg_rougeL:.4f}")
+    return avg_bleu 
 
 
 #=======================================================================================================
 #                                                                                         Training Loop
 #=======================================================================================================
 
-ce_loss_fn = CrossEntropyLoss()
-cosine_loss_fn = CosineEmbeddingLoss()
+wandb.init(
+    project="dna-text-fusion",
+    name=f"run-epochs-{NUM_EPOCHS}",
+    config={
+        "learning_rate": LEARNING_RATE,
+        "batch_size": BATCH_SIZE,
+        "grad_accum_steps": GRAD_ACCUM_STEPS,
+        "epochs": NUM_EPOCHS,
+        "semantic_loss_weight": SEMANTIC_LOSS_WEIGHT,
+        "max_seq_length": MAX_SEQ_LENGTH
+    }
+)
+
+scaler = GradScaler()
+def contrastive_nce_loss(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    # Normalize embeddings
+    a = torch.nn.functional.normalize(a, dim=-1)
+    b = torch.nn.functional.normalize(b, dim=-1)
+
+    logits = a @ b.T  # [B, B]
+    logits /= temperature
+
+    targets = torch.arange(a.size(0), device=a.device)
+    return nn.CrossEntropyLoss()(logits, targets)
+
+def mean_pool(hidden_states, attention_mask):
+    mask = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
+    summed = (hidden_states * mask).sum(dim=1)
+    summed_mask = mask.sum(dim=1).clamp(min=1e-9)
+    return summed / summed_mask
+
+epochs_no_improve = 0
 
 for epoch in range(NUM_EPOCHS):
     model.train()
-    total_loss = 0.0
-    grad_norms = []
-
+    total_loss, grad_norms = 0.0, []
+    step_times = []
     optimizer.zero_grad()
-    progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-    
-    for step, batch in enumerate(progress_bar):
+
+    start_time = time()
+    progress_bar = tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", unit="step")
+
+    for step, batch in enumerate(train_loader):
+        step_start = time()
+
         dna_inputs = {
             "input_ids": batch["dna_input_ids"].to(device),
             "attention_mask": batch["dna_attention_mask"].to(device),
@@ -229,77 +399,112 @@ for epoch in range(NUM_EPOCHS):
             "attention_mask": batch["text_attention_mask"].to(device),
         }
 
-        # Text → DNA prediction (exact match)
-        dna_labels = batch["dna_labels"].to(device)  # shape: (B, L)
-        dna_logits = model.generate_dna_from_text(text_inputs)  # shape: (B, L, V)
+        outputs = model(dna_inputs, text_inputs)
+        text_logits = outputs["text_logits"]
+        text_hidden = outputs["text_hidden"]
 
-        # Cross-entropy loss for Text → DNA (exact token match)
-        text2dna_loss = ce_loss_fn(
-            dna_logits.view(-1, dna_logits.size(-1)),
-            dna_labels.view(-1)
+        # Token-level CE loss (autoregressive)
+        ce_loss = F.cross_entropy(
+            text_logits.view(-1, text_logits.size(-1)),
+            text_inputs["input_ids"].view(-1),
+            ignore_index=text_tokenizer.pad_token_id
         )
 
-        # DNA → Text prediction (semantic match)
-        text_preds = model.generate_text_from_dna(dna_inputs)  # shape: (B, L)
-        # Convert token IDs to strings (detokenize)
-        predicted_sentences = text_tokenizer.batch_decode(text_preds, skip_special_tokens=True)
-        target_sentences = text_tokenizer.batch_decode(batch["text_input_ids"], skip_special_tokens=True)
-
-        # Cosine similarity loss for DNA → Text (semantic similarity)
+        # Contrastive supervision from generated sequences
         with torch.no_grad():
-            # Get embeddings directly from text_model
-            text_model.eval()
-            
-            # Get hidden states for predicted and target sentences
-            pred_outputs = text_model(input_ids=text_tokenizer(predicted_sentences, return_tensors="pt").input_ids.to(device), attention_mask=text_tokenizer(predicted_sentences, return_tensors="pt").attention_mask.to(device))
-            target_outputs = text_model(input_ids=text_tokenizer(target_sentences, return_tensors="pt").input_ids.to(device), attention_mask=text_tokenizer(target_sentences, return_tensors="pt").attention_mask.to(device))
-            
-            # Assuming we take the last hidden state for embeddings (you could also try other pooling strategies)
-            pred_embeddings = pred_outputs.last_hidden_state[:, 0, :]  # Taking the embedding of the [CLS] token (you can modify this depending on your strategy)
-            target_embeddings = target_outputs.last_hidden_state[:, 0, :]  # Taking the embedding of the [CLS] token (you can modify this depending on your strategy)
-            
-        # Cosine similarity loss
-        cosine_targets = torch.ones(pred_embeddings.size(0)).to(device)  # All pairs should be similar
-        dna2text_loss = cosine_loss_fn(pred_embeddings, target_embeddings, cosine_targets)
+            model.eval()
+            generated_ids = model.generate_text_from_dna(dna_inputs, max_length=MAX_SEQ_LENGTH)
+            model.train()
 
-        # Combine losses (tune SEMANTIC_LOSS_WEIGHT as needed)
-        loss = text2dna_loss + SEMANTIC_LOSS_WEIGHT * dna2text_loss
+        pred_sentences = text_tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+        target_sentences = text_tokenizer.batch_decode(text_inputs["input_ids"], skip_special_tokens=True)
 
-        # Track gradient norm
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        grad_norms.append(grad_norm.item())
+        pred_enc = text_tokenizer(pred_sentences, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LENGTH).to(device)
+        target_enc = text_tokenizer(target_sentences, return_tensors="pt", padding=True, truncation=True, max_length=MAX_SEQ_LENGTH).to(device)
 
-        # Update progress bar with current loss
-        progress_bar.set_postfix({
-            "loss": loss.item(),
-            "T→D": text2dna_loss.item(),
-            "D→T": dna2text_loss.item(),
-            "grad_norm": grad_norm.item()
-        })
+        with torch.no_grad():
+            target_hidden = text_model(**target_enc, output_hidden_states=True).hidden_states[-1]
+
+        pred_embed = mean_pool(text_hidden, text_inputs["attention_mask"])
+        target_embed = mean_pool(target_hidden, target_enc["attention_mask"])
+
+        with autocast():
+            temp = max(0.07, 0.5 - (epoch / NUM_EPOCHS) * 0.4)
+            contrastive_loss = contrastive_nce_loss(pred_embed, target_embed, temperature=temp)
+            global_step = step + epoch * len(train_loader)
+            total_steps = NUM_EPOCHS * len(train_loader)
+            alpha = SEMANTIC_LOSS_WEIGHT * max(0.1, min(1.0, global_step / (0.3 * total_steps)))
+            loss = alpha * contrastive_loss + (1 - alpha) * ce_loss
+
+        scaler.scale(loss).backward()
 
         if (step + 1) % GRAD_ACCUM_STEPS == 0:
-            optimizer.step()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norms.append(grad_norm.item())
+
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
 
+        step_end = time()
+        step_duration = step_end - step_start
+        step_times.append(step_duration)
+        avg_step_time = sum(step_times[-10:]) / min(len(step_times), 10)
+        eta_minutes = avg_step_time * (len(train_loader) - (step + 1)) / 60
+
+        progress_bar.set_postfix({
+            "loss": f"{loss.item():.4f}",
+            "CE": f"{ce_loss.item():.4f}",
+            "D→T": f"{contrastive_loss.item():.4f}",
+            "α": f"{alpha:.2f}",
+            "grad_norm": f"{grad_norm.item():.2f}" if 'grad_norm' in locals() else "-",
+            "eta_min": f"{eta_minutes:.1f}"
+        })
+        progress_bar.update(1)
         total_loss += loss.item()
 
+        # 🔁 wandb step log
+        current_lr = optimizer.param_groups[0]['lr']
+        wandb.log({
+            "step_loss": loss.item(),
+            "ce_loss": ce_loss.item(),
+            "contrastive_loss": contrastive_loss.item(),
+            "alpha": alpha,
+            "grad_norm": grad_norm.item() if 'grad_norm' in locals() else None,
+            "learning_rate": current_lr,
+            "step": step + 1 + epoch * len(train_loader),
+            "eta_min": eta_minutes
+        })
+
+    progress_bar.close()
+    epoch_time = time() - start_time
     avg_loss = total_loss / len(train_loader)
     avg_grad_norm = sum(grad_norms) / len(grad_norms)
 
     # Evaluate
-    val_f1 = evaluate(model, test_loader)
+    bleu_score = evaluate(model, test_loader, tokenizer=text_tokenizer, device=device, show_examples=3, current_epoch=epoch+1)
 
-    print(f"[Epoch {epoch+1}/{NUM_EPOCHS}] Loss: {avg_loss:.4f} | GradNorm: {avg_grad_norm:.4f} | Val F1: {val_f1:.4f}")
+    print(f"[Epoch {epoch+1}] ⏱️ Time: {epoch_time:.1f}s | Loss: {avg_loss:.4f} | GradNorm: {avg_grad_norm:.4f} | BLEU: {bleu_score:.4f}")
 
-    # Early stopping logic
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
+    wandb.log({
+        "epoch": epoch + 1,
+        "avg_loss": avg_loss,
+        "avg_grad_norm": avg_grad_norm,
+        "bleu_score": bleu_score,
+        "epoch_time_sec": epoch_time
+    })
+
+    if bleu_score > BEST_VALUE:
+        BEST_VALUE = bleu_score
         epochs_no_improve = 0
-        print("✨ New best model found!")
+        print("✨ New best model saved!")
         torch.save(model.state_dict(), "best_model.pt")
+        wandb.log({"best_model_saved": True})
     else:
         epochs_no_improve += 1
         if epochs_no_improve >= EARLY_STOP_PATIENCE:
             print("⏹️ Early stopping triggered.")
+            wandb.log({"early_stopped": True})
             break

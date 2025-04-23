@@ -68,4 +68,6 @@ This architecture enables bidirectional translation between DNA sequences and hu
 Contributions are welcome! Please submit a pull request or open an issue for any bugs or feature requests.
 
 ## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+This software is proprietary and confidential. Unauthorized copying, use, modification, or distribution of this software is strictly prohibited. All rights reserved.
+
+See the LICENSE file for full terms and conditions.
