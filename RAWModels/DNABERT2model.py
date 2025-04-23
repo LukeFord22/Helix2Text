@@ -16,7 +16,7 @@ import random
 import wandb
 
 #=======================================================================================================
-#                                                                                   Adjustable Parameters
+#                                                                                  Adjustable Parameters
 #=======================================================================================================
 torch.autograd.set_detect_anomaly(True)
 
@@ -28,11 +28,45 @@ BEST_VALUE = 0
 BATCH_SIZE = 2
 NUM_EPOCHS = 3
 LEARNING_RATE = 3e-5
-MAX_SEQ_LENGTH = 32
+MAX_SEQ_LENGTH = 16
 GRAD_ACCUM_STEPS = 4
-TRAIN_DATA_FRACTION = 0.1
+TRAIN_DATA_FRACTION = 0.01
 SEMANTIC_LOSS_WEIGHT = 0.5
-FROZEN_LAYERS = 24
+FROZEN_LAYERS = 12
+
+#=======================================================================================================
+#                                                                                         Model loading
+#=======================================================================================================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+#== DNABERT-2 Model ==
+dna_model_path = "zhihan1996/DNABERT-2-117M"
+dna_tokenizer = AutoTokenizer.from_pretrained(dna_model_path, trust_remote_code=True)
+config = BertConfig.from_pretrained(dna_model_path)
+dna_model = AutoModel.from_pretrained(dna_model_path, config=config, trust_remote_code=True).to(device)
+
+
+#== BioGPT Model ==
+text_model_path = "microsoft/biogpt-large-pubmedqa"
+text_tokenizer = AutoTokenizer.from_pretrained(text_model_path, trust_remote_code=True)
+if text_tokenizer.pad_token is None:
+    text_tokenizer.pad_token = text_tokenizer.eos_token
+    text_tokenizer.pad_token_id = text_tokenizer.eos_token_id
+text_tokenizer.padding_side = 'left'
+text_model = AutoModelForCausalLM.from_pretrained(
+    text_model_path, 
+    trust_remote_code=True,
+    pad_token_id=text_tokenizer.eos_token_id
+).to(device)
+
+def freeze_gpt_layers(model, num_layers_to_freeze=FROZEN_LAYERS):
+    for i, block in enumerate(model.gpt_cross.transformer_blocks):
+        if i < num_layers_to_freeze:
+            for param in block.parameters():
+                param.requires_grad = False
+    print(f"✅ Frozen BioGPT layers: 0 through {num_layers_to_freeze - 1}")
+
+
 #=======================================================================================================
 #                                                                                        Dataset Loading
 #======================================================================================================= 
@@ -81,39 +115,6 @@ test_loader = DataLoader(tokenized_data['test'], batch_size=BATCH_SIZE, pin_memo
 
 
 #=======================================================================================================
-#                                                                                         Model loading
-#=======================================================================================================
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-#== DNABERT-2 Model ==
-dna_model_path = "zhihan1996/DNABERT-2-117M"
-dna_tokenizer = AutoTokenizer.from_pretrained(dna_model_path, trust_remote_code=True)
-config = BertConfig.from_pretrained(dna_model_path)
-dna_model = AutoModel.from_pretrained(dna_model_path, config=config, trust_remote_code=True).to(device)
-
-
-#== BioGPT Model ==
-text_model_path = "microsoft/biogpt-large-pubmedqa"
-text_tokenizer = AutoTokenizer.from_pretrained(text_model_path, trust_remote_code=True)
-if text_tokenizer.pad_token is None:
-    text_tokenizer.pad_token = text_tokenizer.eos_token
-    text_tokenizer.pad_token_id = text_tokenizer.eos_token_id
-text_tokenizer.padding_side = 'left'
-text_model = AutoModelForCausalLM.from_pretrained(
-    text_model_path, 
-    trust_remote_code=True,
-    pad_token_id=text_tokenizer.eos_token_id
-).to(device)
-
-def freeze_gpt_layers(model, num_layers_to_freeze=FROZEN_LAYERS):
-    for i, block in enumerate(model.gpt_cross.gpt.transformer.h):
-        if i < num_layers_to_freeze:
-            for param in block.parameters():
-                param.requires_grad = False
-    print(f"✅ Frozen GPT-2 layers: 0 through {num_layers_to_freeze - 1}")
-
-
-#=======================================================================================================
 #                                                                                     Model Architecture
 #=======================================================================================================
 
@@ -147,51 +148,73 @@ class GPTWithCrossAttention(nn.Module):
         super().__init__()
         self.gpt = gpt_model
         
-        # BioGPT uses a slightly different architecture
-        # Access the transformer blocks correctly
-        self.transformer_blocks = gpt_model.model.layers
+        # BioGPT has a different structure - layers are directly in the biogpt encoder
+        self.transformer_blocks = gpt_model.biogpt.layers
         
         self.cross_attention_blocks = nn.ModuleList([
             CrossAttentionBlock(
-                hidden_size=gpt_model.config.hidden_size,  # Use hidden_size instead of n_embd
+                hidden_size=gpt_model.config.hidden_size,
                 cross_hidden_size=cross_hidden_size,
-                n_heads=gpt_model.config.num_attention_heads  # Use num_attention_heads
+                n_heads=gpt_model.config.num_attention_heads
             ) for _ in range(len(self.transformer_blocks))
         ])
         self.insert_every_n = insert_every_n
         
-        # Get the appropriate embedding layers
-        self.wte = gpt_model.model.embed_tokens
-        # May not have position embeddings in same way
-        self.has_position_embedding = hasattr(gpt_model.model, 'embed_positions')
+        # Get the appropriate embedding layers from BioGPT
+        self.wte = gpt_model.biogpt.embed_tokens
+        
+        # BioGPT uses position embeddings differently
+        self.has_position_embedding = hasattr(gpt_model.biogpt, 'embed_positions')
         if self.has_position_embedding:
-            self.wpe = gpt_model.model.embed_positions
+            self.wpe = gpt_model.biogpt.embed_positions
             
-        # Final layer norm and output projection
-        self.ln_f = gpt_model.model.norm
-        self.lm_head = gpt_model.lm_head
+        # Final layer norm and output projection for BioGPT
+        self.ln_f = gpt_model.biogpt.layer_norm
+        
+        # BioGPT doesn't have a separate lm_head attribute, its output layer is integrated
+        # We'll create a projection matching the vocabulary size
+        self.lm_head = nn.Linear(gpt_model.config.hidden_size, gpt_model.config.vocab_size)
+        # Initialize with the same weights as in BioGPT's output projection
+        if hasattr(gpt_model, 'output_projection'):
+            self.lm_head.weight.data = gpt_model.output_projection.weight.data.clone()
+        elif hasattr(gpt_model.biogpt, 'output_projection'): 
+            self.lm_head.weight.data = gpt_model.biogpt.output_projection.weight.data.clone()
 
     def forward(self, input_ids, attention_mask, dna_context, dna_mask=None):
         B, L = input_ids.shape
         
-        # Handle embeddings differently for BioGPT
+        # Handle embeddings for BioGPT
         hidden_states = self.wte(input_ids)
         
         # Add position embeddings if available
         if self.has_position_embedding:
-            position_ids = self.wpe.make_positions(input_ids)
-            hidden_states = hidden_states + self.wpe(position_ids)
+            position_embeddings = self.wpe(input_ids)
+            hidden_states = hidden_states + position_embeddings
         
         # Process through layers with cross-attention
         for i, block in enumerate(self.transformer_blocks):
-            # For BioGPT, we need to pass attention mask differently
-            hidden_states = block(hidden_states, attention_mask=attention_mask)[0]
+            # BioGPT expects a different format for attention mask
+            # Create an appropriate attention mask format for BioGPT
+            attention_mask_expanded = attention_mask.unsqueeze(1).unsqueeze(2)
+            
+            # Call the layer - BioGPT takes different parameters
+            layer_outputs = block(
+                hidden_states,
+                attention_mask=attention_mask_expanded
+            )
+            hidden_states = layer_outputs[0]
+            
+            # Apply cross-attention
             if i % self.insert_every_n == 0:
                 hidden_states = self.cross_attention_blocks[i](hidden_states, dna_context, dna_mask)
 
+        # Apply final layer norm
         hidden_states = self.ln_f(hidden_states)
-        return self.lm_head(hidden_states), hidden_states
-
+        
+        # Get logits
+        logits = self.lm_head(hidden_states)
+        
+        return logits, hidden_states
 
 class DNATextFusion(nn.Module):
     def __init__(self, dna_encoder, gpt_model, hidden_size=768):
@@ -203,12 +226,13 @@ class DNATextFusion(nn.Module):
             cross_hidden_size=hidden_size
         )
         self.dna_proj = nn.Sequential(
-            nn.Linear(hidden_size, gpt_model.config.n_embd),
-            nn.LayerNorm(gpt_model.config.n_embd)
+            nn.Linear(hidden_size, gpt_model.config.hidden_size),  # Use hidden_size, not n_embd
+            nn.LayerNorm(gpt_model.config.hidden_size)
         )
 
-        self.bos_token_id = gpt_model.config.bos_token_id
-        self.eos_token_id = gpt_model.config.eos_token_id
+        # Use text_tokenizer's special tokens since model.config might not have them
+        self.bos_token_id = text_tokenizer.bos_token_id
+        self.eos_token_id = text_tokenizer.eos_token_id
 
     def encode_dna(self, dna_inputs):
         dna_out = self.dna_encoder(
@@ -262,7 +286,7 @@ class DNATextFusion(nn.Module):
 
 
 model = DNATextFusion(dna_encoder=dna_model, gpt_model=text_model).to(device)
-freeze_gpt_layers(model, num_layers_to_freeze=3)
+freeze_gpt_layers(model, num_layers_to_freeze=FROZEN_LAYERS)
 
 #== optimizer ==
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)

@@ -1,0 +1,28 @@
+## Helix2Text Training Configuration
+
+# Project settings
+project_name: "dna-text-fusion"
+experiment_name: "biogpt-dna-fusion-v1"
+
+# Training parameters
+training:
+  batch_size: 2
+  num_epochs: 8
+  learning_rate: 3e-5
+  max_seq_length: 512
+  grad_accum_steps: 5  # Effective batch size = batch_size * grad_accum_steps
+  train_data_fraction: 1.0
+  semantic_loss_weight: 0.5
+  frozen_layers: 0
+  early_stop_patience: 3
+
+# Model architecture
+model:
+  dna_model_path: "metagene-ai/METAGENE-1-BnB-4Bit"
+  text_model_path: "microsoft/biogpt-large-pubmedqa"
+  cross_attn_interval: 4  # Add cross-attention every N layers
+  hidden_dim: 768
+
+# Data configuration
+data:
+  local_path: "protein_to_dna_sequence_descriptions.csv"
