@@ -56,6 +56,16 @@ class DNATextFusion(nn.Module):
         dna_hidden = dna_model.config.hidden_size
         text_hidden = text_model.config.hidden_size if hasattr(text_model.config, 'hidden_size') else text_model.config.n_embd
         self.hidden_dim = text_hidden
+
+        # Enable memory-efficient attention (xformers if available)
+        if hasattr(dna_model, 'config'):
+            dna_model.config.use_cache = False
+        if hasattr(text_model, 'config'):
+            text_model.config.use_cache = False
+            
+        # Enable gradient checkpointing
+        dna_model.gradient_checkpointing_enable()
+        text_model.gradient_checkpointing_enable()
         
         # Modality-specific adapters
         self.dna_adapter = ModalityAdapter(dna_hidden)
@@ -79,18 +89,28 @@ class DNATextFusion(nn.Module):
         self.cross_blocks = nn.ModuleList([
             NormalizedGatedCrossAttentionBlock(
                 dim=text_hidden, 
-                cross_dim=text_hidden, 
+                cross_dim=dna_hidden,  # Pass different dimension if they don't match 
                 n_heads=8 if not hasattr(text_model.config, 'n_head') else text_model.config.n_head
             ) if i % cross_attn_interval == 0 else None 
             for i in range(len(self.gpt_blocks))
         ])
         
         # Fusion block for deeper integration
-        self.fusion_block = LearnableFusionBlock(text_hidden)
+        self.fusion_block = LearnableFusionBlock(
+            hidden_dim=text_hidden,
+            input_dim_x=text_hidden,
+            input_dim_y=dna_hidden
+        )
         
-        # Unified contrastive projection head
+        # Calculate total input size for joint projection
+        joint_input_size = text_hidden + dna_hidden
+
+        # Projection for DNA before joint embedding
+        self.project_dna_for_joint = nn.Linear(dna_hidden, text_hidden)
+
+        # Unified contrastive projection head (now with correct input dimension)
         self.joint_projection = nn.Sequential(
-            nn.Linear(text_hidden * 2, text_hidden),
+            nn.Linear(text_hidden * 2, text_hidden),  # We'll project DNA to text_hidden first
             nn.GELU(),
             nn.LayerNorm(text_hidden)
         )
@@ -104,23 +124,35 @@ class DNATextFusion(nn.Module):
             self.lm_head = text_model.output_projection if hasattr(text_model, 'output_projection') else text_model.biogpt.output_projection
     
     def encode_dna(self, dna_inputs):
-        """
-        Encode DNA inputs to text-compatible embeddings.
-        
-        Args:
-            dna_inputs: Dictionary with DNA input_ids and attention_mask
-            
-        Returns:
-            Encoded DNA representations
-        """
+        """Process DNA inputs through the DNA model."""
+        # Set output_hidden_states=True to get all hidden states
         dna_outputs = self.dna_model(
             input_ids=dna_inputs["input_ids"],
             attention_mask=dna_inputs["attention_mask"],
-            output_hidden_states=True
+            output_hidden_states=True  # Important to get hidden states
         )
-        dna_hidden = dna_outputs.hidden_states[-1]
+        
+        # Extract hidden states - different models provide them differently
+        if hasattr(dna_outputs, 'hidden_states'):
+            # Get the last hidden state (from the last layer)
+            dna_hidden = dna_outputs.hidden_states[-1]
+        elif hasattr(dna_outputs, 'last_hidden_state'):
+            dna_hidden = dna_outputs.last_hidden_state
+        else:
+            # Fallback: if we can't get hidden states directly, extract from the base model
+            # This accesses the outputs before the LM head
+            dna_hidden = self.dna_model.base_model(
+                input_ids=dna_inputs["input_ids"],
+                attention_mask=dna_inputs["attention_mask"]
+            ).last_hidden_state
+        
+        # Cast to the same dtype as model weights
+        target_dtype = next(self.dna_adapter.parameters()).dtype
+        dna_hidden = dna_hidden.to(dtype=target_dtype)
+        
+        # Continue with adapted DNA representation
         adapted_dna = self.dna_adapter(dna_hidden)
-        return self.dna_to_text_proj(adapted_dna)
+        return adapted_dna
     
     def encode_text(self, text_inputs):
         """
@@ -169,14 +201,25 @@ class DNATextFusion(nn.Module):
             
         Returns:
             Dictionary containing model outputs
+
         """
-        # Modality-specific encoding and adaptation
-        dna_context = self.encode_dna(dna_inputs)  # [B, L_dna, H_text]
-        text_hidden = self.encode_text(text_inputs)  # [B, L_text, H_text]
         
-        hidden_states = text_hidden
+        # Free memory where possible
+        torch.cuda.empty_cache()
+        
+        # Process inputs just once
+        dna_context = self.encode_dna(dna_inputs)
+        text_hidden = self.encode_text(text_inputs)
+        
+        # From here, we no longer need the original inputs, so we can delete them
+        if "input_ids" in dna_inputs:
+            del dna_inputs["input_ids"]
+        if "input_ids" in text_inputs:
+            del text_inputs["input_ids"]
+        torch.cuda.empty_cache()
         
         # Inject gated cross-attention selectively
+        hidden_states = text_hidden
         for block, cross_block in zip(self.gpt_blocks, self.cross_blocks):
             # Apply the model's own self-attention block
             if hasattr(block, '__call__'):
@@ -191,15 +234,18 @@ class DNATextFusion(nn.Module):
                     hidden_states, dna_context, dna_inputs["attention_mask"]
                 )
         
-        # Mean pooling for sequence-level representations
+        # Mean pooling for sequence-level representations  
         text_pooled = hidden_states.mean(dim=1)  # Text mean pool
         dna_pooled = dna_context.mean(dim=1)     # DNA mean pool
-        
+
+        # Project DNA pooled representation to match text dimension
+        dna_pooled_proj = self.project_dna_for_joint(dna_pooled)
+
         # Final fusion for joint embedding
         fused_representation = self.fusion_block(text_pooled, dna_pooled)
-        
+
         # Joint embedding for contrastive learning
-        joint_embedding = self.joint_projection(torch.cat([text_pooled, dna_pooled], dim=-1))
+        joint_embedding = self.joint_projection(torch.cat([text_pooled, dna_pooled_proj], dim=-1))
         
         # LM logits from final hidden states
         logits = self.lm_head(self.ln_f(hidden_states))
