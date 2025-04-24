@@ -108,8 +108,6 @@ def train_model(config=None):
     # Initialize cross-entropy loss
     ce_loss_fn = torch.nn.CrossEntropyLoss()
     
-    # Initialize gradient scaler for mixed precision
-    scaler = GradScaler()
     
     # Training tracking variables
     best_bleu = 0
@@ -128,48 +126,49 @@ def train_model(config=None):
         # Training steps
         for step, batch in enumerate(progress_bar):
             # Move inputs to device
-            dna_inputs = {k: v.to(device) for k, v in batch.items() if "dna" in k}
-            text_inputs = {k: v.to(device) for k, v in batch.items() if "text" in k}
+            dna_inputs = {
+                "input_ids": batch["dna_input_ids"].to(device),
+                "attention_mask": batch["dna_attention_mask"].to(device),
+            }
+            text_inputs = {
+                "input_ids": batch["text_input_ids"].to(device),
+                "attention_mask": batch["text_attention_mask"].to(device),
+            }
+
+            # Text → DNA prediction (exact match)
+            outputs = model(dna_inputs=dna_inputs, text_inputs=text_inputs)
             
-            # Forward pass and loss calculation
-            with torch.cuda.amp.autocast():
-                # Text → DNA prediction (exact match)
-                outputs = model(dna_inputs=dna_inputs, text_inputs=text_inputs)
-                
-                # Cross-entropy loss for prediction
-                text2dna_loss = ce_loss_fn(
-                    outputs["logits"].view(-1, outputs["logits"].size(-1)),
-                    batch["dna_input_ids"].to(device).view(-1)
-                )
-                
-                # Contrastive loss between embeddings
-                contrastive_loss, contrastive_metrics = contrastive_loss_fn(
-                    outputs["joint_embedding"],
-                    outputs["fused_representation"],
-                    epoch=epoch
-                )
-                
-                # Combine losses
-                loss = text2dna_loss + contrastive_loss
-                loss = loss / config.training.grad_accum_steps
+            # Cross-entropy loss for prediction
+            text2dna_loss = ce_loss_fn(
+                outputs["logits"].view(-1, outputs["logits"].size(-1)),
+                batch["dna_input_ids"].to(device).view(-1)
+            )
+            
+            # Contrastive loss between embeddings
+            contrastive_loss, contrastive_metrics = contrastive_loss_fn(
+                outputs["joint_embedding"],
+                outputs["fused_representation"],
+                epoch=epoch
+            )
+            
+            # Combine losses
+            loss = text2dna_loss + contrastive_loss
+            loss = loss / config.training.grad_accum_steps
             
             # Backward pass with gradient accumulation
-            scaler.scale(loss).backward()
+            loss.backward()
             
             # Step optimizer every grad_accum_steps
             if (step + 1) % config.training.grad_accum_steps == 0:
-                # Unscale for gradient clipping
-                scaler.unscale_(optimizer)
-                
-                # Gradient clipping
+                # Gradient clipping without unscaling
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 grad_norms.append(grad_norm.item())
                 
-                # Optimizer and scheduler steps
-                scaler.step(optimizer)
-                scaler.update()
+                # Regular optimizer step without scaler
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
             
             # Track loss
             total_loss += loss.item()

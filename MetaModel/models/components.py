@@ -5,39 +5,81 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LearnableFusionBlock(nn.Module):
-    """
-    Fusion block with learnable gating for combining modality embeddings.
+    """Block that fuses two representations with learnable weights."""
     
-    This block learns to combine embeddings from different modalities (DNA and text)
-    using a learnable gating mechanism that adapts to the importance of each modality.
-    """
-    def __init__(self, hidden_dim):
+    def __init__(self, hidden_dim, input_dim_x=None, input_dim_y=None):
         super().__init__()
+        self.hidden_dim = hidden_dim
+        
+        # Store input dimensions or use hidden_dim as default
+        self.input_dim_x = input_dim_x if input_dim_x is not None else hidden_dim
+        self.input_dim_y = input_dim_y if input_dim_y is not None else hidden_dim
+        
+        # Calculate the total input dimension for the gate
+        self.combined_dim = self.input_dim_x + self.input_dim_y
+        
+        # Create projection layers if dimensions don't match
+        self.project_x = None
+        self.project_y = None
+        
+        if self.input_dim_x != hidden_dim:
+            self.project_x = nn.Linear(self.input_dim_x, hidden_dim)
+            
+        if self.input_dim_y != hidden_dim:
+            self.project_y = nn.Linear(self.input_dim_y, hidden_dim)
+        
+        # Gate mechanism controls how much of each representation to use
         self.gate = nn.Sequential(
+            nn.Linear(self.combined_dim, hidden_dim * 2),
+            nn.GELU(),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.Sigmoid()
         )
-        self.linear = nn.Sequential(
+        
+        # Fusion layer combines the two representations
+        self.fusion = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.LayerNorm(hidden_dim)
         )
-
-    def forward(self, text_hidden, dna_hidden):
+    
+    def forward(self, x, y):
         """
-        Combine text and DNA embeddings with learned gating.
+        Fuse two representations with adaptive weights.
         
         Args:
-            text_hidden: Text modality embeddings of shape [batch_size, hidden_dim]
-            dna_hidden: DNA modality embeddings of shape [batch_size, hidden_dim]
+            x: First representation tensor (batch_size, seq_len, input_dim_x)
+            y: Second representation tensor (batch_size, seq_len, input_dim_y)
             
         Returns:
-            Fused embeddings of shape [batch_size, hidden_dim]
+            Fused representation (batch_size, seq_len, hidden_dim)
         """
-        combined = torch.cat([text_hidden, dna_hidden], dim=-1)
+        # Project inputs if needed
+        if self.project_x is not None:
+            x_proj = self.project_x(x)
+        else:
+            x_proj = x
+            
+        if self.project_y is not None:
+            y_proj = self.project_y(y)
+        else:
+            y_proj = y
+        
+        # Calculate gate values based on concatenated input
+        combined = torch.cat([x, y], dim=-1)  # Use original inputs for gate calculation
         gate = self.gate(combined)
-        fused = gate * text_hidden + (1 - gate) * dna_hidden
-        return self.linear(torch.cat([fused, dna_hidden], dim=-1))
+        
+        # Apply gating mechanism
+        gated = (gate * x_proj) + ((1 - gate) * y_proj)
+        
+        # Final fusion
+        combined_proj = torch.cat([x_proj, y_proj], dim=-1)
+        fused = self.fusion(combined_proj)
+        
+        # Residual connection with the gated output
+        output = gated + fused
+        
+        return output
 
 class ModalityAdapter(nn.Module):
     """

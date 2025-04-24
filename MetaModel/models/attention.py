@@ -5,56 +5,82 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class NormalizedGatedCrossAttentionBlock(nn.Module):
-    """
-    Cross-attention block with gating and normalization.
+    """Cross-attention block with layer normalization and gating."""
     
-    This block allows one modality to attend to another with a learnable
-    gating parameter that controls the influence of the cross-attention.
-    """
-    def __init__(self, dim, cross_dim, n_heads=8, dropout=0.1):
+    def __init__(self, dim, cross_dim=None, n_heads=8):
         super().__init__()
+        self.dim = dim
+        self.cross_dim = cross_dim if cross_dim is not None else dim
+        
+        # Add projection if dimensions don't match
+        self.needs_projection = self.cross_dim != self.dim
+        if self.needs_projection:
+            self.cross_projection = nn.Linear(self.cross_dim, self.dim)
+        
+        # Layer normalization for stability
+        self.norm_self = nn.LayerNorm(dim)
+        self.norm_cross = nn.LayerNorm(self.cross_dim)
+        
+        # Cross-attention mechanism
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=dim, 
-            kdim=cross_dim, 
-            vdim=cross_dim,
-            num_heads=n_heads, 
-            batch_first=True,
-            dropout=dropout
+            embed_dim=dim,
+            num_heads=n_heads,
+            batch_first=True
         )
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.dropout = nn.Dropout(dropout)
-        # Learnable parameter to control the influence of cross-attention
-        self.alpha = nn.Parameter(torch.tensor(0.5))
-
-    def forward(self, x, context, context_mask=None):
+        
+        # Gating mechanism to control cross-modal influence
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x, cross, cross_mask=None):
         """
-        Apply cross-attention between x and context.
+        Forward pass through the cross-attention block.
         
         Args:
-            x: Query tensor of shape (batch_size, seq_len, dim)
-            context: Key/value tensor of shape (batch_size, context_len, cross_dim)
-            context_mask: Optional mask for context of shape (batch_size, context_len)
+            x: Query tensor (batch_size, seq_len_q, dim)
+            cross: Key/value tensor (batch_size, seq_len_kv, cross_dim)
+            cross_mask: Attention mask (batch_size, seq_len_kv)
             
         Returns:
-            Updated tensor after cross-attention
+            Updated tensor after cross-attention (batch_size, seq_len_q, dim)
         """
-        # Convert mask from [0, 1] to boolean for nn.MultiheadAttention
-        key_padding_mask = None if context_mask is None else ~context_mask.bool()
+        # Normalize inputs
+        normed_x = self.norm_self(x)
+        normed_cross = self.norm_cross(cross)
         
-        # Apply layer normalization before attention
-        x_norm = self.norm1(x)
+        # Project cross to matching dimension if needed
+        if self.needs_projection:
+            normed_cross = self.cross_projection(normed_cross)
         
-        # Multihead cross-attention
+        # Process attention mask - key_padding_mask expects shape (batch_size, seq_len_kv)
+        # and value of True for positions to be masked out (ignored)
+        key_padding_mask = None
+        if cross_mask is not None:
+            # Convert to boolean mask where True indicates masked positions
+            key_padding_mask = ~cross_mask.bool()
+            
+            # Ensure the mask has shape (batch_size, seq_len_kv)
+            if key_padding_mask.dim() > 2:
+                key_padding_mask = key_padding_mask.squeeze(1)
+        
+        # Apply cross-attention - key_padding_mask will be directly passed to MultiheadAttention
         cross_output, _ = self.cross_attn(
-            query=x_norm, 
-            key=context, 
-            value=context, 
+            query=normed_x,
+            key=normed_cross,
+            value=normed_cross,
             key_padding_mask=key_padding_mask
         )
         
+        # Calculate adaptive gate values
+        gate_input = torch.cat([normed_x, cross_output], dim=-1)
+        gate_val = self.gate(gate_input)
+        
         # Apply gated residual connection
-        return self.norm2(x + self.alpha * self.dropout(cross_output))
+        out = x + gate_val * cross_output
+        
+        return out
     
 class CrossModalityTransformerBlock(nn.Module):
     """
