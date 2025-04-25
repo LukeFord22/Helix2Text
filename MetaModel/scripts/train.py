@@ -118,6 +118,9 @@ def train_model(config=None):
         model.train()
         total_loss = 0.0
         grad_norms = []
+        max_step_times = 100
+        step_times = []
+        
         
         # Initialize progress bar
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.training.num_epochs}")
@@ -125,6 +128,12 @@ def train_model(config=None):
         
         # Training steps
         for step, batch in enumerate(progress_bar):
+            
+            #log time
+            step_start_time = time.time()
+            steps_done = step + 1 + epoch * len(train_loader)
+            total_training_steps = config.training.num_epochs * len(train_loader)
+
             # Move inputs to device
             dna_inputs = {
                 "input_ids": batch["dna_input_ids"].to(device),
@@ -135,12 +144,17 @@ def train_model(config=None):
                 "attention_mask": batch["text_attention_mask"].to(device),
             }
 
-            # Text → DNA prediction (exact match)
             outputs = model(dna_inputs=dna_inputs, text_inputs=text_inputs)
             
-            # Cross-entropy loss for prediction
-            text2dna_loss = ce_loss_fn(
-                outputs["logits"].view(-1, outputs["logits"].size(-1)),
+            # Cross-entropy loss for Text (predict text from DNA)
+            text_ce_loss = ce_loss_fn(
+                outputs["text_logits"].view(-1, outputs["text_logits"].size(-1)),
+                batch["text_input_ids"].to(device).view(-1)
+            )
+
+            # Cross-entropy loss for DNA (predict DNA from text)
+            dna_ce_loss = ce_loss_fn(
+                outputs["dna_logits"].view(-1, outputs["dna_logits"].size(-1)),
                 batch["dna_input_ids"].to(device).view(-1)
             )
             
@@ -151,9 +165,17 @@ def train_model(config=None):
                 epoch=epoch
             )
             
-            # Combine losses
-            loss = text2dna_loss + contrastive_loss
-            loss = loss / config.training.grad_accum_steps
+            # Weighted loss combination
+            dna_weight = config.training.dna_loss_weight 
+            text_weight = config.training.text_loss_weight  
+            contrastive_weight = config.training.contrastive_loss_weight 
+
+            # Combine losses with weights
+            loss = (
+                dna_weight * dna_ce_loss +
+                text_weight * text_ce_loss +
+                contrastive_weight * contrastive_loss
+            ) / config.training.grad_accum_steps
             
             # Backward pass with gradient accumulation
             loss.backward()
@@ -173,21 +195,26 @@ def train_model(config=None):
             # Track loss
             total_loss += loss.item()
             
-            # Calculate remaining training time (ETA)
-            steps_done = step + 1 + epoch * len(train_loader)
-            total_training_steps = config.training.num_epochs * len(train_loader)
-            if step > 0:
-                steps_per_sec = step / ((time.time() - epoch_start_time) or 1)
-                remaining_steps = total_training_steps - steps_done
-                eta_seconds = remaining_steps / steps_per_sec
-                eta_minutes = eta_seconds / 60
-            else:
-                eta_minutes = None
+            step_end_time = time.time()
+            step_duration = step_end_time - step_start_time
+
+            # Update step times list
+            step_times.append(step_duration)
+            if len(step_times) > max_step_times:
+                step_times.pop(0)  # Remove oldest timing
+
+            # Calculate ETA based on recent average
+            avg_step_time = sum(step_times) / len(step_times)
+            remaining_steps = total_training_steps - steps_done
+            eta_seconds = remaining_steps * avg_step_time
+            eta_minutes = eta_seconds / 60
+            eta_hours = eta_minutes / 60
                 
             # Log step metrics
             step_metrics = {
                 "step_loss": loss.item(),
-                "text2dna_loss": text2dna_loss.item(),
+                "DNA": dna_ce_loss.item(),
+                "Text": text_ce_loss.item(),
                 **contrastive_metrics,
                 "learning_rate": optimizer.param_groups[0]['lr'],
                 "step": steps_done,
@@ -201,10 +228,12 @@ def train_model(config=None):
             
             # Update progress bar
             progress_bar.set_postfix({
-                "loss": loss.item(),
-                "t2d": text2dna_loss.item(),
-                "contr": contrastive_loss.item(),
-                "temp": contrastive_metrics["contrastive_temperature"]
+                "Loss": loss.item(),
+                "DNA": dna_ce_loss.item(),
+                "Text": text_ce_loss.item(),
+                "Cont": contrastive_loss.item(),
+                "temp": contrastive_metrics["contrastive_temperature"],
+                "eta_min": eta_minutes
             })
         
         # Calculate epoch metrics

@@ -10,11 +10,17 @@ class TrainingConfig:
     learning_rate: float = 3e-5
     max_seq_length: int = 512
     grad_accum_steps: int = 5
-    train_data_fraction: float = 0.8  # Default: use 80% of data
+    train_data_fraction: float = 1  
     train_split_fraction: float = 0.9  # Default: 90% for training, 10% for evaluation
     semantic_loss_weight: float = 0.5
-    frozen_layers: int = 0
+    frozenGPT_layers: int = 0
+    frozenDNA_layers: int = 0
     early_stop_patience: int = 3
+
+    # Loss weights
+    dna_loss_weight: 0.5     
+    text_loss_weight: 0.5      
+    contrastive_loss_weight: 1 
     
 @dataclass
 class ModelConfig:

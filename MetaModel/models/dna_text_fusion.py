@@ -115,13 +115,22 @@ class DNATextFusion(nn.Module):
             nn.LayerNorm(text_hidden)
         )
         
-        # Final LM head setup based on model type
+        # Two separate LM heads based on model types
         if hasattr(text_model, 'transformer'):
             self.ln_f = text_model.transformer.ln_f
-            self.lm_head = text_model.lm_head
+            self.text_lm_head = text_model.lm_head  # For generating text
         elif hasattr(text_model, 'biogpt'):
             self.ln_f = text_model.biogpt.layer_norm
-            self.lm_head = text_model.output_projection if hasattr(text_model, 'output_projection') else text_model.biogpt.output_projection
+            self.text_lm_head = text_model.output_projection if hasattr(text_model, 'output_projection') else text_model.biogpt.output_projection
+            
+        # DNA LM head - use the same structure as the text model's head but with DNA vocab size
+        if hasattr(dna_model, 'lm_head'):
+            self.dna_lm_head = dna_model.lm_head  # For generating DNA
+        else:
+            # Create a new head for DNA if not available
+            # First get DNA vocab size
+            dna_vocab_size = dna_model.config.vocab_size
+            self.dna_lm_head = nn.Linear(text_hidden, dna_vocab_size)  # From text to DNA
     
     def encode_dna(self, dna_inputs):
         """Process DNA inputs through the DNA model."""
@@ -247,12 +256,17 @@ class DNATextFusion(nn.Module):
         # Joint embedding for contrastive learning
         joint_embedding = self.joint_projection(torch.cat([text_pooled, dna_pooled_proj], dim=-1))
         
-        # LM logits from final hidden states
-        logits = self.lm_head(self.ln_f(hidden_states))
+        # Two separate logit outputs
+        text_informed_by_dna = self.ln_f(hidden_states)  # Text hidden states informed by DNA
+        dna_informed_by_text = self.text_to_dna_proj(hidden_states)  # Project to DNA space
         
+        # Generate logits for both directions
+        text_logits = self.text_lm_head(text_informed_by_dna)  # For text prediction
+        dna_logits = self.dna_lm_head(dna_informed_by_text)  # For DNA prediction
+            
         return {
-            "logits": logits,
-            "dna_logits": logits,  # Compatible with existing training loop
+            "text_logits": text_logits,  # For generating text from DNA
+            "dna_logits": dna_logits,    # For generating DNA from text
             "joint_embedding": joint_embedding,
             "fused_representation": fused_representation,
             "text_hidden": hidden_states,

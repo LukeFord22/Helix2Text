@@ -110,6 +110,11 @@ class DNATextContrastiveLoss(nn.Module):
         Returns:
             Combined contrastive loss and metrics dict
         """
+
+        # Normalize embeddings
+        pred_embeddings = F.normalize(pred_embeddings, dim=1)
+        target_embeddings = F.normalize(target_embeddings, dim=1)
+
         # Apply temperature annealing
         temp = max(self.min_temp, self.initial_temp - (epoch / self.total_epochs) * 
                    (self.initial_temp - self.min_temp))
