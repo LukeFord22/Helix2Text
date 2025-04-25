@@ -18,6 +18,7 @@ from ..models.dna_text_fusion import DNATextFusion, load_models
 from ..losses.contrastive import DNATextContrastiveLoss
 from ..training.evaluation import evaluate_model
 from ..utils.optimization import create_optimizer_and_scheduler
+from ..utils.logging import log_batch_examples
 
 def set_seed(seed=42):
     """Set random seeds for reproducibility."""
@@ -253,6 +254,80 @@ def train_model(config=None):
         
         bleu_score = eval_metrics["bleu_score"]
         
+        # Get a batch of examples from the test loader to visualize
+        example_batch = next(iter(test_loader))
+        
+        # Move batch to device
+        example_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                         for k, v in example_batch.items()}
+        
+        # Generate text predictions from DNA sequences
+        with torch.no_grad():
+            model.eval()
+            outputs = model.generate(
+                input_ids=example_batch["dna_input_ids"],
+                attention_mask=example_batch["dna_attention_mask"],
+                max_new_tokens=100,  # Adjust based on your expected output length
+                num_beams=4
+            )
+            
+            # Decode the generated text
+            generated_texts = [text_tokenizer.decode(out, skip_special_tokens=True) 
+                              for out in outputs]
+            
+            # Decode the reference text
+            reference_texts = [text_tokenizer.decode(ref, skip_special_tokens=True) 
+                              for ref in example_batch["text_input_ids"]]
+        
+            # Log the examples
+            log_batch_examples(
+                batch=example_batch,
+                generated_texts=generated_texts,
+                reference_texts=reference_texts,
+                tokenizer=dna_tokenizer,  # For decoding DNA sequences
+                prefix=f"epoch_{epoch+1}",
+                max_examples=3  # Number of examples to log
+            )
+
+        # Generate DNA sequences from text inputs (reverse direction)
+        with torch.no_grad():
+            model.eval()
+            # Your model must support generating DNA from text
+            dna_outputs = model.generate_dna(
+                input_ids=example_batch["text_input_ids"],
+                attention_mask=example_batch["text_attention_mask"],
+                max_new_tokens=150,  # DNA sequences might be longer
+                num_beams=4
+            )
+            
+            # Decode the generated DNA sequences
+            generated_dna = [dna_tokenizer.decode(out, skip_special_tokens=True) 
+                            for out in dna_outputs]
+            
+            # Decode the reference DNA sequences
+            reference_dna = [dna_tokenizer.decode(ref, skip_special_tokens=True) 
+                            for ref in example_batch["dna_input_ids"]]
+            
+            # Create a modified batch with swapped fields for Text→DNA direction
+            # This works with your existing log_batch_examples implementation
+            text2dna_batch = {
+                "dna_input_ids": example_batch["text_input_ids"],  # Text is the "input" for this direction
+                "text_input_ids": example_batch["dna_input_ids"],  # DNA is the "target" for this direction
+                # Include any other required fields
+                "dna_attention_mask": example_batch["text_attention_mask"],
+                "text_attention_mask": example_batch["dna_attention_mask"]
+            }
+            
+            # Log the Text→DNA examples
+            log_batch_examples(
+                batch=text2dna_batch,
+                generated_texts=generated_dna,  # Generated DNA sequences
+                reference_texts=reference_dna,  # Reference DNA sequences
+                tokenizer=text_tokenizer,  # For decoding text sequences (the "DNA" in this direction)
+                prefix=f"epoch_{epoch+1}_text2dna",  # Different prefix to distinguish direction
+                max_examples=3  # Number of examples to log
+            )
+
         # Log epoch metrics
         wandb.log({
             "epoch": epoch + 1,
