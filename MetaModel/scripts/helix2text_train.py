@@ -12,18 +12,17 @@ import torch
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
 from datetime import datetime
 import random
 import numpy as np
 import subprocess
-import json
+
 
 # Add the parent directory to the path so we can import the modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from MetaModel.configs.default_config import default_config
-from MetaModel.scripts.train import train_model
+from MetaModel.training.train import train_model
 from MetaModel.models.dna_text_fusion import DNATextFusion, load_models
 from MetaModel.data.dataset import get_data_loaders
 
@@ -33,7 +32,7 @@ from MetaModel.data.dataset import get_data_loaders
 # Modify these parameters according to your needs
 
 # Path Configuration
-DATA_PATH = "protein_to_dna_sequence_descriptions.csv"  # Path to your training data
+DATA_PATH = "\MetaModel\data\protein_to_dna_sequence_descriptions.csv"  # Path to your training data
 OUTPUT_MODEL_PATH = "best_model.pt"  # Where to save the trained model
 
 # Training Hyperparameters
@@ -89,7 +88,7 @@ def setup_distributed(rank, world_size):
     Initialize the distributed environment.
     """
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', str(random.randint(10000, 20000)))
     
     # Initialize the process group
     dist.init_process_group(backend=DISTRIBUTED_BACKEND, rank=rank, world_size=world_size)
@@ -145,18 +144,22 @@ def train_process(rank, world_size):
         # Set output model path
         config.output_path = OUTPUT_MODEL_PATH
         
-        # Enable DeepSpeed with ZeRO optimization
+        # Update DeepSpeed configuration to use ZeRO-3 with offloading
         config.deepspeed.use_deepspeed = True
-        config.deepspeed.zero_stage = 2  # Optimizer state partitioning
+        config.deepspeed.zero_stage = 3  # Optimizer + parameter sharding and offloading
         config.deepspeed.fp16_enabled = True  # Enable mixed precision
-        config.deepspeed.num_gpus = world_size
-        
-        # Offload optimizer states and parameters to CPU
+
+        # Add memory-efficient configuration for DeepSpeed
         config.deepspeed.offload_optimizer = True
-        config.deepspeed.offload_param = True  # More aggressive memory saving
-        
+        config.deepspeed.offload_param = True
+        config.deepspeed.zero3_init_flag = True  # Enable ZeRO-3 initialization optimization
+        config.deepspeed.zero3_save_16bit_model = True  # Save in FP16 format
+        config.deepspeed.sub_group_size = 1e9  # Large value to reduce communication
+        config.deepspeed.contiguous_gradients = True  # More efficient gradient handling
+        config.deepspeed.overlap_comm = True  # Overlap communication with computation
+
         if is_main_process:
-            print("DeepSpeed ZeRO-2 enabled with optimizer/parameter offloading and mixed precision")
+            print("DeepSpeed ZeRO-3 enabled with parameter/optimizer offloading for maximum memory efficiency")
         
         # Set random seed for reproducibility (adding rank for process-specific randomness)
         set_seed(42 + rank)
@@ -207,8 +210,11 @@ def train_process(rank, world_size):
             cross_attn_interval=config.model.cross_attn_interval
         ).to(device)
         
+
+        model = model.half()
+
         # Wrap model with DDP
-        model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=True)
+        model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=False)
         
         # Add DDP integration info to config
         config.ddp_runtime = {
@@ -321,17 +327,21 @@ def main():
         # Set output model path
         config.output_path = OUTPUT_MODEL_PATH
         
-        # Enable DeepSpeed with ZeRO optimization for single GPU training
+        # Update DeepSpeed configuration to use ZeRO-3 with offloading
         config.deepspeed.use_deepspeed = True
-        config.deepspeed.zero_stage = 2  # Optimizer state partitioning
+        config.deepspeed.zero_stage = 3  # Optimizer + parameter sharding and offloading
         config.deepspeed.fp16_enabled = True  # Enable mixed precision
-        config.deepspeed.num_gpus = 1
-        
-        # Offload optimizer states and parameters to CPU
+
+        # Add memory-efficient configuration for DeepSpeed
         config.deepspeed.offload_optimizer = True
-        config.deepspeed.offload_param = True  # More aggressive memory saving
-        
-        print("DeepSpeed ZeRO-2 enabled with optimizer/parameter offloading and mixed precision")
+        config.deepspeed.offload_param = True
+        config.deepspeed.zero3_init_flag = True  # Enable ZeRO-3 initialization optimization
+        config.deepspeed.zero3_save_16bit_model = True  # Save in FP16 format
+        config.deepspeed.sub_group_size = 1e9  # Large value to reduce communication
+        config.deepspeed.contiguous_gradients = True  # More efficient gradient handling
+        config.deepspeed.overlap_comm = True  # Overlap communication with computation
+
+        print("DeepSpeed ZeRO-3 enabled with parameter/optimizer offloading for maximum memory efficiency")
         
         # Configure distributed attributes (single-process mode)
         config.distributed = {

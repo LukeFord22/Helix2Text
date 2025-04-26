@@ -37,7 +37,7 @@ def info_nce_loss(features, temperature=0.07, batch_size=None):
     mask.scatter_(1, labels.unsqueeze(1), 1)
     
     # InfoNCE loss calculation
-    exp_sim = torch.exp(similarity_matrix)
+    exp_sim = torch.exp(similarity_matrix - similarity_matrix.max(dim=1, keepdim=True)[0])
     log_prob = similarity_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True))
     mean_log_prob = (mask * log_prob).sum(1) / mask.sum(1)
     

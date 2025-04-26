@@ -1,26 +1,17 @@
-"""Main training script for DNA-Text fusion models."""
-
-import os
-import argparse
-import yaml
-import time
-import random
+# Core modules
+import os, sys, time, random, argparse, yaml
 import numpy as np
 import torch
+from datetime import datetime
 from torch.cuda.amp import GradScaler
 from tqdm import tqdm
 import wandb
-import sys
-import io
-from datetime import datetime
 
-# Import from our modular structure
-from ..configs.default_config import Config, default_config
-from ..data.dataset import get_data_loaders
-from ..models.dna_text_fusion import DNATextFusion, load_models
-from ..losses.contrastive import DNATextContrastiveLoss
-from ..training.evaluation import evaluate_model
-from ..utils.optimization import create_optimizer_and_scheduler
+# Helix2Text modules
+from ..configs.default_config import default_config
+from .contrastive import DNATextContrastiveLoss
+from .evaluation import evaluate_model
+from .setup import setup_training
 from ..utils.logging import log_batch_examples_bidirectional
 
 def set_seed(seed=42):
@@ -104,139 +95,13 @@ def train_model(config=None):
     deepspeed_config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
                                          "configs", "ds.config.json")
     
-    # Determine device and distributed settings
-    if using_deepspeed:
-        # Extract DeepSpeed configuration
+    model, optimizer, scheduler, train_loader, test_loader, device, is_main_process, local_rank, dna_tokenizer, text_tokenizer = setup_training(config)
+    
+    # For DeepSpeed, store reference to model_engine
+    model_engine = None
+    if using_deepspeed and hasattr(config, 'deepspeed_runtime') and hasattr(config.deepspeed_runtime, 'model_engine'):
         model_engine = config.deepspeed_runtime.get('model_engine')
-        local_rank = config.deepspeed_runtime.get('local_rank', -1)
-        is_main_process = local_rank <= 0
-        device = model_engine.device if model_engine else torch.device('cuda')
-        print(f"Using DeepSpeed with device: {device}, local_rank: {local_rank}")
-    elif using_ddp or using_distributed:
-        # Extract DDP configuration
-        if using_ddp:
-            # If passing the model directly via ddp_runtime
-            model = config.ddp_runtime.get('model')
-            local_rank = config.ddp_runtime.get('rank', -1)
-            device = config.ddp_runtime.get('device', torch.device('cuda'))
-        else:
-            # If using the distributed flag only
-            local_rank = config.distributed.get('rank', -1)
-            device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-        
-        is_main_process = local_rank == 0
-        print(f"Using PyTorch DDP with device: {device}, rank: {local_rank}")
-    else:
-        # Standard single-GPU training
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        is_main_process = True
-        local_rank = -1
-        print(f"Using standard training with device: {device}")
-    
-    # Set random seed for reproducibility
-    set_seed(42 + (local_rank if local_rank >= 0 else 0))
-    
-    # Initialize wandb only on main process with DDP-compatible settings
-    if is_main_process:
-        # Create a unique run group ID that can be shared across processes if needed
-        run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
-        # Set the WANDB_RUN_GROUP environment variable for potential process coordination
-        os.environ["WANDB_RUN_GROUP"] = f"ddp_training_{run_id}"
-        
-        # Make sure wandb doesn't reinitialize if a run already exists
-        if not wandb.run:
-            wandb.init(
-                project=config.project_name,
-                name=config.experiment_name,
-                config={
-                    "training": vars(config.training),
-                    "model": vars(config.model),
-                    "data": vars(config.data),
-                    "distributed": {
-                        "enabled": using_ddp or using_distributed,
-                        "world_size": config.ddp_runtime.get('world_size', 1) if using_ddp 
-                                    else config.distributed.get('world_size', 1) if using_distributed 
-                                    else 1
-                    }
-                }
-            )
-    else:
-        # For non-main processes, disable wandb completely
-        os.environ["WANDB_MODE"] = "disabled"
-    
-    # For DeepSpeed, we extract from runtime config
-    if using_deepspeed:
-        model = model_engine.module if hasattr(model_engine, 'module') else model_engine
-        optimizer = model_engine.optimizer
-        scheduler = None  # DeepSpeed handles this
-        
-        # Get data loaders from the config
-        dna_tokenizer = config.deepspeed_runtime.get('dna_tokenizer')
-        text_tokenizer = config.deepspeed_runtime.get('text_tokenizer')
-        train_loader = config.deepspeed_runtime.get('train_loader')
-        test_loader = config.deepspeed_runtime.get('test_loader')
-    
-    # For DDP, we extract from runtime config
-    elif using_ddp:
-        # The model is already wrapped with DDP
-        model = config.ddp_runtime.get('model')
-        dna_tokenizer = config.ddp_runtime.get('dna_tokenizer')
-        text_tokenizer = config.ddp_runtime.get('text_tokenizer')
-        
-        # Create data loaders with distributed sampler
-        from torch.utils.data.distributed import DistributedSampler
-        
-        # Create data loaders
-        train_loader, test_loader = get_data_loaders(
-            dna_tokenizer=dna_tokenizer,
-            text_tokenizer=text_tokenizer,
-            config=config,
-            rank=local_rank,
-            world_size=config.ddp_runtime.get('world_size', 1),
-            use_distributed_sampler=True
-        )
-        
-        # Create optimizer and scheduler
-        optimizer, scheduler = create_optimizer_and_scheduler(
-            model=model,
-            lr=config.training.learning_rate,
-            steps_per_epoch=len(train_loader),
-            num_epochs=config.training.num_epochs,
-            grad_accum_steps=config.training.grad_accum_steps
-        )
-    
-    # Standard training setup
-    else:
-        # Load tokenizers and models
-        dna_tokenizer, text_tokenizer, dna_model, text_model = load_models(
-            dna_model_path=config.model.dna_model_path,
-            text_model_path=config.model.text_model_path,
-            device=device
-        )
-        
-        # Create data loaders
-        train_loader, test_loader = get_data_loaders(
-            dna_tokenizer=dna_tokenizer,
-            text_tokenizer=text_tokenizer,
-            config=config
-        )
-        
-        # Initialize model
-        model = DNATextFusion(
-            dna_model=dna_model,
-            text_model=text_model,
-            cross_attn_interval=config.model.cross_attn_interval
-        ).to(device)
-        
-        # Create optimizer and scheduler
-        optimizer, scheduler = create_optimizer_and_scheduler(
-            model=model,
-            lr=config.training.learning_rate,
-            steps_per_epoch=len(train_loader),
-            num_epochs=config.training.num_epochs,
-            grad_accum_steps=config.training.grad_accum_steps
-        )
-    
+
     # Initialize contrastive loss
     contrastive_loss_fn = DNATextContrastiveLoss(
         initial_temp=0.5,
@@ -282,6 +147,7 @@ def train_model(config=None):
         
         # Training steps
         for step, batch in enumerate(progress_bar):
+
             # log time
             step_start_time = time.time()
             steps_done = step + 1 + epoch * len(train_loader)
@@ -351,7 +217,7 @@ def train_model(config=None):
                     if scheduler:
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                    torch.cuda.empty_cache()
+
             else:
                 # DeepSpeed handles gradient accumulation internally
                 model_engine.backward(loss)
@@ -431,6 +297,7 @@ def train_model(config=None):
                 })
         
         # Calculate epoch metrics
+        torch.cuda.empty_cache()
         avg_loss = total_loss / len(train_loader)
         avg_grad_norm = sum(grad_norms) / max(len(grad_norms), 1) if grad_norms else 0
         epoch_time = time.time() - epoch_start_time
@@ -476,11 +343,12 @@ def train_model(config=None):
             # Generate text predictions from DNA sequences
             with torch.no_grad():
                 eval_model.eval()
-                outputs = eval_model.generate(
-                    input_ids=example_batch["dna_input_ids"],
-                    attention_mask=example_batch["dna_attention_mask"],
-                    max_new_tokens=100,  # Adjust based on your expected output length
-                    num_beams=4
+                outputs = eval_model.generate_text_from_dna(
+                    dna_inputs={
+                        "input_ids": example_batch["dna_input_ids"],
+                        "attention_mask": example_batch["dna_attention_mask"]
+                    },
+                    max_length=100
                 )
                 
                 # Decode the generated text
@@ -506,11 +374,12 @@ def train_model(config=None):
             # Generate DNA sequences from text inputs (reverse direction)
             with torch.no_grad():
                 eval_model.eval()
-                dna_outputs = eval_model.generate_dna(
-                    input_ids=example_batch["text_input_ids"],
-                    attention_mask=example_batch["text_attention_mask"],
-                    max_new_tokens=150,
-                    num_beams=4
+                dna_outputs = eval_model.generate_dna_from_text(
+                    text_inputs={
+                        "input_ids": example_batch["text_input_ids"],
+                        "attention_mask": example_batch["text_attention_mask"]
+                    },
+                    max_length=100
                 )
                 
                 # Decode the generated DNA sequences

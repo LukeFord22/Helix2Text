@@ -16,3 +16,4 @@ pyyaml>=6.0.0
 tokenizers>=0.13.0
 sacremoses>=0.0.53
 deepspeed>=0.5.10
+flash-attn>=2.0.0

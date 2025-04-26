@@ -3,20 +3,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 
-from .attention import NormalizedGatedCrossAttentionBlock
+from .attention import CrossModalityTransformerBlock
 from .components import LearnableFusionBlock, ModalityAdapter
 from ..data.tokenizers import load_tokenizers
 
-def load_models(dna_model_path, text_model_path, device='cuda'):
+def load_models(dna_model_path, text_model_path, device='cuda', use_half=True):
     """
-    Load pretrained DNA and text models.
+    Load pretrained DNA and text models with memory optimization.
     
     Args:
         dna_model_path: Path to the DNA model
         text_model_path: Path to the text model
         device: Device to load models to
+        use_half: Whether to use half precision (fp16)
         
     Returns:
         Tuple of (dna_tokenizer, text_tokenizer, dna_model, text_model)
@@ -24,19 +25,43 @@ def load_models(dna_model_path, text_model_path, device='cuda'):
     # Load tokenizers
     dna_tokenizer, text_tokenizer = load_tokenizers(dna_model_path, text_model_path)
     
-    # Load DNA model with quantization
+    # Load DNA model with memory optimizations
     dna_model = AutoModelForCausalLM.from_pretrained(
         dna_model_path,
         trust_remote_code=True,
-        device_map="auto"
+        torch_dtype=torch.float16 if use_half else torch.float32,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+        attn_implementation="flash_attention_2"
     )
+    print(dna_model.config.attn_implementation)
     
-    # Load text model
+    # Move to device and convert to half precision if requested
+    if use_half and dna_model.dtype != torch.float16:
+        dna_model = dna_model.half()
+    
+    # Load text model with memory optimizations
     text_model = AutoModelForCausalLM.from_pretrained(
         text_model_path,
         trust_remote_code=True,
-        pad_token_id=text_tokenizer.eos_token_id
+        torch_dtype=torch.float16 if use_half else torch.float32,
+        low_cpu_mem_usage=True,
+        pad_token_id=text_tokenizer.eos_token_id,
+        attn_implementation="flash_attention_2"
     ).to(device)
+    
+    # Convert to half precision if requested and not already done
+    if use_half and text_model.dtype != torch.float16:
+        text_model = text_model.half()
+    
+    # Enable gradient checkpointing immediately after loading
+    dna_model.gradient_checkpointing_enable()
+    text_model.gradient_checkpointing_enable()
+    
+    # Garbage collect to free memory
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     
     return dna_tokenizer, text_tokenizer, dna_model, text_model
 
@@ -60,10 +85,23 @@ class DNATextFusion(nn.Module):
         # Enable memory-efficient attention (xformers if available)
         if hasattr(dna_model, 'config'):
             dna_model.config.use_cache = False
+            # Try to enable flash attention if available
+            try:
+                if hasattr(dna_model, 'enable_flash_attention'):
+                    dna_model.enable_flash_attention()
+            except:
+                pass
+                
         if hasattr(text_model, 'config'):
             text_model.config.use_cache = False
+            # Try to enable flash attention if available
+            try:
+                if hasattr(text_model, 'enable_flash_attention'):
+                    text_model.enable_flash_attention()
+            except:
+                pass
             
-        # Enable gradient checkpointing
+        # Enable gradient checkpointing with more aggressive offloading
         dna_model.gradient_checkpointing_enable()
         text_model.gradient_checkpointing_enable()
         
@@ -71,9 +109,9 @@ class DNATextFusion(nn.Module):
         self.dna_adapter = ModalityAdapter(dna_hidden)
         self.text_adapter = ModalityAdapter(text_hidden)
         
-        # Cross-modality projections
-        self.dna_to_text_proj = nn.Linear(dna_hidden, text_hidden)
-        self.text_to_dna_proj = nn.Linear(text_hidden, dna_hidden)
+        # Cross-modality projections with more lightweight options
+        self.dna_to_text_proj = nn.Linear(dna_hidden, text_hidden, bias=False)  # Remove bias for memory efficiency
+        self.text_to_dna_proj = nn.Linear(text_hidden, dna_hidden, bias=False)  # Remove bias for memory efficiency
         
         # Get transformer blocks depending on model architecture
         if hasattr(text_model, 'transformer'):
@@ -87,13 +125,23 @@ class DNATextFusion(nn.Module):
         
         # Cross-attention blocks
         self.cross_blocks = nn.ModuleList([
-            NormalizedGatedCrossAttentionBlock(
-                dim=text_hidden, 
-                cross_dim=dna_hidden,  # Pass different dimension if they don't match 
-                n_heads=8 if not hasattr(text_model.config, 'n_head') else text_model.config.n_head
-            ) if i % cross_attn_interval == 0 else None 
-            for i in range(len(self.gpt_blocks))
+            CrossModalityTransformerBlock(
+                dim=text_hidden,
+                cross_dim=dna_hidden,
+                n_heads=text_model.config.n_head if hasattr(text_model.config, 'n_head') else 8
+            )
+            for _ in range(len(self.gpt_blocks))
         ])
+        
+        # Enable memory-efficient attention for all cross-attention blocks
+        for block in self.cross_blocks:
+            if block is not None:
+                # Try to enable flash attention for cross-attention if available
+                try:
+                    if hasattr(block.cross_attn, '_use_flash_attention'):
+                        block.cross_attn._use_flash_attention = True
+                except:
+                    pass
         
         # Fusion block for deeper integration
         self.fusion_block = LearnableFusionBlock(
@@ -102,15 +150,12 @@ class DNATextFusion(nn.Module):
             input_dim_y=dna_hidden
         )
         
-        # Calculate total input size for joint projection
-        joint_input_size = text_hidden + dna_hidden
+        # Project DNA before joint embedding
+        self.project_dna_for_joint = nn.Linear(dna_hidden, text_hidden, bias=False)  # Remove bias for efficiency
 
-        # Projection for DNA before joint embedding
-        self.project_dna_for_joint = nn.Linear(dna_hidden, text_hidden)
-
-        # Unified contrastive projection head (now with correct input dimension)
+        # Unified contrastive projection head with more efficient design
         self.joint_projection = nn.Sequential(
-            nn.Linear(text_hidden * 2, text_hidden),  # We'll project DNA to text_hidden first
+            nn.Linear(text_hidden * 2, text_hidden),
             nn.GELU(),
             nn.LayerNorm(text_hidden)
         )
@@ -134,72 +179,54 @@ class DNATextFusion(nn.Module):
     
     def encode_dna(self, dna_inputs):
         """Process DNA inputs through the DNA model."""
-        # Set output_hidden_states=True to get all hidden states
+        input_ids = dna_inputs["input_ids"]
+        attention_mask = dna_inputs["attention_mask"]
+        
+        # Build flash-style attention mask
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()
+
+        position_ids = torch.arange(0, input_ids.size(1), device=input_ids.device).unsqueeze(0)
+
         dna_outputs = self.dna_model(
-            input_ids=dna_inputs["input_ids"],
-            attention_mask=dna_inputs["attention_mask"],
-            output_hidden_states=True  # Important to get hidden states
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True
         )
-        
-        # Extract hidden states - different models provide them differently
-        if hasattr(dna_outputs, 'hidden_states'):
-            # Get the last hidden state (from the last layer)
-            dna_hidden = dna_outputs.hidden_states[-1]
-        elif hasattr(dna_outputs, 'last_hidden_state'):
-            dna_hidden = dna_outputs.last_hidden_state
-        else:
-            # Fallback: if we can't get hidden states directly, extract from the base model
-            # This accesses the outputs before the LM head
-            dna_hidden = self.dna_model.base_model(
-                input_ids=dna_inputs["input_ids"],
-                attention_mask=dna_inputs["attention_mask"]
-            ).last_hidden_state
-        
-        # Cast to the same dtype as model weights
-        target_dtype = next(self.dna_adapter.parameters()).dtype
-        dna_hidden = dna_hidden.to(dtype=target_dtype)
-        
-        # Continue with adapted DNA representation
-        adapted_dna = self.dna_adapter(dna_hidden)
+
+        dna_hidden = dna_outputs.hidden_states[-1]
+        adapted_dna = self.dna_adapter(dna_hidden.to(dtype=next(self.dna_adapter.parameters()).dtype))
         return adapted_dna
     
     def encode_text(self, text_inputs):
-        """
-        Encode text inputs to hidden representations.
+        """Encode text inputs."""
+        input_ids = text_inputs["input_ids"]
+        attention_mask = text_inputs["attention_mask"]
         
-        Args:
-            text_inputs: Dictionary with text input_ids and attention_mask
-            
-        Returns:
-            Encoded text representations
-        """
-        # Handle different model architectures
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2).float()
+        position_ids = torch.arange(0, input_ids.size(1), device=input_ids.device).unsqueeze(0)
+
         if hasattr(self.text_model, 'transformer'):
-            # GPT-2 style
             text_outputs = self.text_model.transformer(
-                input_ids=text_inputs["input_ids"],
-                attention_mask=text_inputs["attention_mask"],
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
                 output_hidden_states=True
             )
         else:
-            # Other architectures like BioGPT
+            print("fixme")
             text_outputs = self.text_model(
-                input_ids=text_inputs["input_ids"],
-                attention_mask=text_inputs["attention_mask"],
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
                 output_hidden_states=True
             )
-        
-        # Get the last hidden state
-        if hasattr(text_outputs, 'hidden_states'):
-            text_hidden = text_outputs.hidden_states[-1]
-        elif hasattr(text_outputs, 'last_hidden_state'):
-            text_hidden = text_outputs.last_hidden_state
-        else:
-            raise ValueError("Could not extract hidden states from text model outputs")
-        
-        adapted_text = self.text_adapter(text_hidden)
+
+        text_hidden = text_outputs.hidden_states[-1]
+        adapted_text = self.text_adapter(text_hidden.to(dtype=next(self.text_adapter.parameters()).dtype))
         return adapted_text
     
+
     def forward(self, dna_inputs, text_inputs):
         """
         Forward pass for DNA-Text fusion model.
@@ -210,78 +237,82 @@ class DNATextFusion(nn.Module):
             
         Returns:
             Dictionary containing model outputs
-
         """
-        
-        # Free memory where possible
-        torch.cuda.empty_cache()
-        
-        # Process inputs just once
+        # Encode DNA and Text
         dna_context = self.encode_dna(dna_inputs)
         text_hidden = self.encode_text(text_inputs)
-        
-        # From here, we no longer need the original inputs, so we can delete them
-        if "input_ids" in dna_inputs:
-            del dna_inputs["input_ids"]
-        if "input_ids" in text_inputs:
-            del text_inputs["input_ids"]
-        torch.cuda.empty_cache()
-        
-        # Inject gated cross-attention selectively
+
+        # Backup input_ids if they require gradients (e.g., for certain loss functions)
+        input_ids_backup = {}
+        for modality, inputs in (("dna", dna_inputs), ("text", text_inputs)):
+            if "input_ids" in inputs:
+                input_ids_backup[modality] = inputs["input_ids"].detach().clone() if inputs["input_ids"].requires_grad else None
+                del inputs["input_ids"]
+
         hidden_states = text_hidden
-        for block, cross_block in zip(self.gpt_blocks, self.cross_blocks):
-            # Apply the model's own self-attention block
-            if hasattr(block, '__call__'):
-                hidden_states = block(hidden_states)[0]
-            else:
-                # Handle models with different block structure
-                hidden_states = block(hidden_states, attention_mask=None)[0]
-                
-            # Apply cross-attention if available at this layer
-            if cross_block is not None:
-                hidden_states = cross_block(
-                    hidden_states, dna_context, dna_inputs["attention_mask"]
-                )
-        
-        # Mean pooling for sequence-level representations  
-        text_pooled = hidden_states.mean(dim=1)  # Text mean pool
-        dna_pooled = dna_context.mean(dim=1)     # DNA mean pool
 
-        # Project DNA pooled representation to match text dimension
+        # Apply CrossModalityTransformer blocks
+        for block in self.cross_blocks:
+            hidden_states = block(hidden_states, dna_context)
+
+        # Pooled representations
+        def masked_mean_pooling(hidden, mask):
+            if mask is not None:
+                expanded_mask = mask.unsqueeze(-1).expand_as(hidden).float()
+                summed = (hidden * expanded_mask).sum(dim=1)
+                mean_pooled = summed / expanded_mask.sum(dim=1).clamp(min=1e-9)
+                return mean_pooled
+            return hidden.mean(dim=1)
+
+        text_pooled = masked_mean_pooling(hidden_states, text_inputs.get("attention_mask"))
+        dna_pooled = masked_mean_pooling(dna_context, dna_inputs.get("attention_mask"))
+
+        # Fusion and contrastive joint embedding
         dna_pooled_proj = self.project_dna_for_joint(dna_pooled)
-
-        # Final fusion for joint embedding
         fused_representation = self.fusion_block(text_pooled, dna_pooled)
-
-        # Joint embedding for contrastive learning
         joint_embedding = self.joint_projection(torch.cat([text_pooled, dna_pooled_proj], dim=-1))
-        
-        # Two separate logit outputs
-        text_informed_by_dna = self.ln_f(hidden_states)  # Text hidden states informed by DNA
-        dna_informed_by_text = self.text_to_dna_proj(hidden_states)  # Project to DNA space
-        
-        # Generate logits for both directions
-        text_logits = self.text_lm_head(text_informed_by_dna)  # For text prediction
-        dna_logits = self.dna_lm_head(dna_informed_by_text)  # For DNA prediction
-            
+
+        # Logits generation
+        text_informed_by_dna = self.ln_f(hidden_states)
+        dna_informed_by_text = self.text_to_dna_proj(hidden_states)
+
+        text_logits = self.text_lm_head(text_informed_by_dna)
+        dna_logits = self.dna_lm_head(dna_informed_by_text)
+
+        # Clean up
+        del hidden_states, text_hidden
+        del input_ids_backup
+        if not dna_context.requires_grad:
+            del dna_context
+
+        # Restore input_ids if needed (optional safety step)
+        for modality, backup in input_ids_backup.items():
+            if backup is not None:
+                if modality == "dna":
+                    dna_inputs["input_ids"] = backup
+                elif modality == "text":
+                    text_inputs["input_ids"] = backup
+
         return {
-            "text_logits": text_logits,  # For generating text from DNA
-            "dna_logits": dna_logits,    # For generating DNA from text
+            "text_logits": text_logits,
+            "dna_logits": dna_logits,
             "joint_embedding": joint_embedding,
             "fused_representation": fused_representation,
-            "text_hidden": hidden_states,
-            "dna_hidden": dna_context
+            "text_pooled": text_pooled,
+            "dna_pooled": dna_pooled,
         }
     
     @torch.no_grad()
-    def generate_text_from_dna(self, dna_inputs, max_length=128, temperature=0.8):
+    def generate_text_from_dna(self, dna_inputs, max_length=128, temperature=0.8, top_k=50, top_p=0.9):
         """
-        Generate text from DNA inputs.
+        Generate text from DNA inputs with optimized memory usage.
         
         Args:
             dna_inputs: Dictionary with DNA input_ids and attention_mask
             max_length: Maximum sequence length to generate
-            temperature: Sampling temperature
+            temperature: Sampling temperature (lower = more deterministic)
+            top_k: Number of highest probability tokens to keep for top-k sampling
+            top_p: Probability threshold for nucleus sampling (cumulative probability)
             
         Returns:
             Generated text token IDs
@@ -289,111 +320,275 @@ class DNATextFusion(nn.Module):
         self.eval()
         device = dna_inputs["input_ids"].device
         
-        # Encode DNA
+        # Encode DNA once to avoid repeated computation
         dna_context = self.encode_dna(dna_inputs)
         
-        # Start with a single token (BOS)
+        # Determine start token
         if hasattr(self.text_model.config, 'bos_token_id'):
             bos_token_id = self.text_model.config.bos_token_id
         else:
             bos_token_id = 0  # Default to 0 if not specified
             
+        # Get batch size from input
+        batch_size = dna_inputs["input_ids"].size(0)
+        
+        # Start with beginning of sequence token
         input_ids = torch.full(
-            (dna_inputs["input_ids"].size(0), 1),
+            (batch_size, 1),
             bos_token_id,
-            device=device
+            device=device,
+            dtype=torch.long
         )
         
+        # Track attention for more efficient generation by reusing context
+        past_key_values = None
+        curr_length = 1
+        
+        # Keep track of which sequences are finished
+        unfinished_sequences = torch.ones(batch_size, device=device, dtype=torch.long)
+        
+        # Create original attention mask (all valid at the start)
+        attention_mask = torch.ones_like(input_ids)
+        
+        # Get EOS token for early stopping
+        eos_token_id = self.text_model.config.eos_token_id if hasattr(self.text_model.config, 'eos_token_id') else None
+        
+        # Set up memory tracking if in debug mode
+        debug_memory = False
+        if debug_memory:
+            memory_before = torch.cuda.memory_allocated() / (1024**2)
+            print(f"Memory before generation: {memory_before:.2f} MB")
+        
         # Autoregressive generation
-        for _ in range(max_length - 1):
-            # Create attention mask for current sequence
-            attention_mask = torch.ones_like(input_ids)
+        while curr_length < max_length:
+            # Encode text - only encode the newly added token by using past_key_values
+            if hasattr(self.text_model, 'transformer'):
+                # GPT-2 style
+
+                position_ids = torch.arange(0, input_ids.size(1), device=device).unsqueeze(0)
+                text_outputs = self.text_model.transformer(
+                    input_ids=input_ids[:, -1:] if past_key_values is not None else input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids[:, -1:] if past_key_values is not None else position_ids,
+                    output_hidden_states=True,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+                hidden_states = text_outputs.hidden_states[-1]
+                past_key_values = text_outputs.past_key_values
+            else:
+                # BioGPT style - may need to adapt based on specific model
+                print("fixme")
+                text_outputs = self.text_model(
+                    input_ids=input_ids[:, -1:] if past_key_values is not None else input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+                hidden_states = text_outputs.hidden_states[-1]
+                past_key_values = text_outputs.past_key_values
             
-            # Encode text
-            text_hidden = self.encode_text({"input_ids": input_ids, "attention_mask": attention_mask})
-            
-            # Apply cross-attention and transformer blocks
-            hidden_states = text_hidden
+            # Apply cross-attention from DNA to the last token's representation
             for block, cross_block in zip(self.gpt_blocks, self.cross_blocks):
-                if hasattr(block, '__call__'):
-                    hidden_states = block(hidden_states)[0]
-                else:
-                    hidden_states = block(hidden_states, attention_mask=None)[0]
-                    
                 if cross_block is not None:
-                    hidden_states = cross_block(hidden_states, dna_context, dna_inputs["attention_mask"])
+                    hidden_states = cross_block(
+                        hidden_states, dna_context, dna_inputs["attention_mask"]
+                    )
             
-            # Get next token logits
-            logits = self.lm_head(self.ln_f(hidden_states[:, -1])) / temperature
+            # Get next token logits - only need the last position
+            next_token_hidden = self.ln_f(hidden_states[:, -1, :])
+            next_token_logits = self.text_lm_head(next_token_hidden) / temperature
+            
+            # Apply filtering for top-k sampling
+            if top_k > 0:
+                top_k = min(top_k, next_token_logits.size(-1))  # Safety check
+                # Remove all tokens with a probability less than the last token of the top-k
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits = next_token_logits.masked_fill(indices_to_remove, -float("Inf"))
+
+            # Apply nucleus (top-p) sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                # Scatter sorted tensors to original indexing
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    dim=1, index=sorted_indices, src=sorted_indices_to_remove
+                )
+                next_token_logits = next_token_logits.masked_fill(indices_to_remove, -float("Inf"))
+            
+            # Convert logits to probabilities
+            probs = F.softmax(next_token_logits, dim=-1)
             
             # Sample next token
-            probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Mark sequences as finished if they generated EOS
+            if eos_token_id is not None:
+                # Update the unfinished_sequences tensor for sequences that hit EOS
+                unfinished_sequences = unfinished_sequences.mul((next_token != eos_token_id).long())
+                
+                # Check if all sequences are finished
+                if unfinished_sequences.max() == 0:
+                    break
             
             # Append to sequence
             input_ids = torch.cat([input_ids, next_token], dim=1)
-            
-            # Stop if EOS token is generated
-            if (next_token == self.text_model.config.eos_token_id).all():
-                break
+            attention_mask = torch.cat([
+                attention_mask, 
+                attention_mask.new_ones((batch_size, 1))
+            ], dim=1)
+            curr_length += 1
+        
+        # Track memory usage if in debug mode
+        if debug_memory:
+            memory_after = torch.cuda.memory_allocated() / (1024**2)
+            print(f"Memory after generation: {memory_after:.2f} MB")
+            print(f"Memory used during generation: {memory_after - memory_before:.2f} MB")
+        
+        # Clean up
+        del dna_context, hidden_states, past_key_values
+        torch.cuda.empty_cache()
                 
         return input_ids
     
     @torch.no_grad()
-    def generate_dna_from_text(self, text_inputs, max_length=512, temperature=0.8):
+    def generate_dna_from_text(self, text_inputs, max_length=512, temperature=0.8, top_k=50, top_p=0.9):
         """
-        Generate DNA sequences from text inputs.
+        Generate DNA sequences from text inputs with memory-efficient decoding.
         
         Args:
             text_inputs: Dictionary with text input_ids and attention_mask
             max_length: Maximum sequence length to generate
-            temperature: Sampling temperature
+            temperature: Sampling temperature (lower = more deterministic)
+            top_k: Number of highest probability tokens to keep for top-k sampling
+            top_p: Probability threshold for nucleus sampling (cumulative probability)
             
         Returns:
             Generated DNA token IDs
         """
         self.eval()
+        device = text_inputs["input_ids"].device
+        batch_size = text_inputs["input_ids"].size(0)
+        
+        # Encode text - do this once to avoid repeated computation
         text_hidden = self.encode_text(text_inputs)
         
         # Project text to DNA space
         text_in_dna_space = self.text_to_dna_proj(text_hidden)
         
-        # Start with a single token (BOS)
-        bos_token_id = self.dna_model.config.bos_token_id if hasattr(self.dna_model.config, 'bos_token_id') else 0
+        # Determine start token
+        if hasattr(self.dna_model.config, 'bos_token_id'):
+            bos_token_id = self.dna_model.config.bos_token_id
+        else:
+            bos_token_id = 0  # Default to 0 if not specified
+            
+        # Start with beginning of sequence token
         input_ids = torch.full(
-            (text_inputs["input_ids"].size(0), 1),
+            (batch_size, 1),
             bos_token_id,
             dtype=torch.long,
-            device=text_inputs["input_ids"].device
+            device=device
         )
         
+        # Create original attention mask
+        attention_mask = torch.ones_like(input_ids)
+        
+        # Keep track of which sequences are finished
+        unfinished_sequences = torch.ones(batch_size, device=device, dtype=torch.long)
+        
+        # Get EOS token for early stopping
+        eos_token_id = self.dna_model.config.eos_token_id if hasattr(self.dna_model.config, 'eos_token_id') else None
+        
+        # Track past key values for more efficient generation
+        past_key_values = None
+        curr_length = 1
+        
         # Generate DNA sequence token by token
-        for _ in range(max_length - 1):
-            # Create attention mask for current sequence
-            attention_mask = torch.ones_like(input_ids)
+        while curr_length < max_length:
+            # Get DNA model outputs for current sequence using efficient caching
+            if past_key_values is not None:
+                # If we have past key values, only process the last token
+                current_token = input_ids[:, -1:]
+                current_mask = attention_mask
+            else:
+                # First iteration - process the full sequence (just the BOS token)
+                current_token = input_ids
+                current_mask = attention_mask
             
-            # Get DNA model outputs for current sequence
+            # Forward pass
             dna_outputs = self.dna_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=current_token,
+                attention_mask=current_mask,
                 encoder_hidden_states=text_in_dna_space,  # Condition on text
                 encoder_attention_mask=text_inputs["attention_mask"],
+                use_cache=True,
+                past_key_values=past_key_values,
                 output_hidden_states=True
             )
+            
+            # Update past key values for next iteration
+            past_key_values = dna_outputs.past_key_values
             
             # Get logits for next token prediction
             next_token_logits = dna_outputs.logits[:, -1, :] / temperature
             
-            # Sample from the distribution
+            # Apply filtering for top-k sampling
+            if top_k > 0:
+                top_k = min(top_k, next_token_logits.size(-1))  # Safety check
+                # Remove all tokens with a probability less than the last token of the top-k
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits = next_token_logits.masked_fill(indices_to_remove, -float("Inf"))
+
+            # Apply nucleus (top-p) sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep also the first token above the threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+
+                # Scatter sorted tensors to original indexing
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    dim=1, index=sorted_indices, src=sorted_indices_to_remove
+                )
+                next_token_logits = next_token_logits.masked_fill(indices_to_remove, -float("Inf"))
+            
+            # Convert logits to probabilities
             probs = F.softmax(next_token_logits, dim=-1)
+            
+            # Sample from the distribution
             next_token = torch.multinomial(probs, num_samples=1)
+            
+            # Mark sequences as finished if they generated EOS
+            if eos_token_id is not None:
+                # Update the unfinished_sequences tensor for sequences that hit EOS
+                unfinished_sequences = unfinished_sequences.mul((next_token != eos_token_id).long())
+                
+                # Check if all sequences are finished
+                if unfinished_sequences.max() == 0:
+                    break
             
             # Append to the sequence
             input_ids = torch.cat([input_ids, next_token], dim=1)
-            
-            # Stop if EOS token is generated
-            eos_token_id = self.dna_model.config.eos_token_id if hasattr(self.dna_model.config, 'eos_token_id') else None
-            if eos_token_id is not None and (next_token == eos_token_id).all():
-                break
+            attention_mask = torch.cat([
+                attention_mask, 
+                attention_mask.new_ones((batch_size, 1))
+            ], dim=1)
+            curr_length += 1
+        
+        # Clean up
+        del text_hidden, text_in_dna_space, past_key_values
+        torch.cuda.empty_cache()
             
         return input_ids
