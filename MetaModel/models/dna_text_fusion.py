@@ -25,6 +25,9 @@ def load_models(dna_model_path, text_model_path, device='cuda', use_half=True):
     # Load tokenizers
     dna_tokenizer, text_tokenizer = load_tokenizers(dna_model_path, text_model_path)
     
+    # Check if this is a BioGPT model (which doesn't support flash attention)
+    is_biogpt = "biogpt" in text_model_path.lower()
+    
     # Load DNA model with memory optimizations
     dna_model = AutoModelForCausalLM.from_pretrained(
         dna_model_path,
@@ -34,20 +37,20 @@ def load_models(dna_model_path, text_model_path, device='cuda', use_half=True):
         device_map="auto",
         attn_implementation="flash_attention_2"
     )
-    print(dna_model.config.attn_implementation)
     
     # Move to device and convert to half precision if requested
     if use_half and dna_model.dtype != torch.float16:
         dna_model = dna_model.half()
     
-    # Load text model with memory optimizations
+    # Load text model with memory optimizations but WITHOUT flash attention for BioGPT
     text_model = AutoModelForCausalLM.from_pretrained(
         text_model_path,
         trust_remote_code=True,
         torch_dtype=torch.float16 if use_half else torch.float32,
         low_cpu_mem_usage=True,
         pad_token_id=text_tokenizer.eos_token_id,
-        attn_implementation="flash_attention_2"
+        # Only use flash attention for non-BioGPT models
+        **({"attn_implementation": "flash_attention_2"} if not is_biogpt else {})
     ).to(device)
     
     # Convert to half precision if requested and not already done

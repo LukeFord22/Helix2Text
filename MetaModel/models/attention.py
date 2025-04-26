@@ -4,10 +4,9 @@ import torch.nn.functional as F
 
 try:
     from transformers.models.llama.modeling_llama import LlamaFlashAttention2
-    FlashAttention = LlamaFlashAttention2
+    FLASH_AVAILABLE = True
 except ImportError:
-    # Fallback if FlashAttention2 is not available
-    FlashAttention = nn.MultiheadAttention
+    FLASH_AVAILABLE = False
 
 
 class NormalizedGatedCrossAttention(nn.Module):
@@ -26,12 +25,20 @@ class NormalizedGatedCrossAttention(nn.Module):
         else:
             self.context_proj = nn.Identity()
 
-        self.cross_attn = FlashAttention(
-            hidden_size=query_dim,
-            num_heads=n_heads,
-            attention_dropout=dropout
-        )
-
+        if FLASH_AVAILABLE:
+            self.cross_attn = LlamaFlashAttention2(
+                hidden_size=query_dim,
+                num_heads=n_heads,
+                attention_dropout=dropout
+            )
+        else:
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=query_dim,
+                num_heads=n_heads,
+                dropout=dropout,
+                batch_first=True
+            )
+            
         self.gate = nn.Sequential(
             nn.Linear(query_dim * 2, query_dim),
             nn.Sigmoid()
@@ -51,14 +58,22 @@ class NormalizedGatedCrossAttention(nn.Module):
             if attn_mask is not None and attn_mask.dtype == torch.bool:
                 attn_mask = attn_mask.float()
 
-        out = self.cross_attn(
-            hidden_states=q,
-            encoder_hidden_states=k,
-            attention_mask=attn_mask,
-            encoder_attention_mask=attn_mask,
-            output_attentions=False,
-            use_cache=False
-        )[0]
+        if FLASH_AVAILABLE:
+            out = self.cross_attn(
+                hidden_states=q,
+                encoder_hidden_states=k,
+                attention_mask=attn_mask,
+                output_attentions=False,
+                use_cache=False
+            )[0]
+        else:
+            out, _ = self.cross_attn(
+                query=q,
+                key=k,
+                value=k,
+                key_padding_mask=mask if mask is not None and mask.dim() == 2 else None,
+                attn_mask=None
+            )
 
         gate_val = self.gate(torch.cat([q, out], dim=-1))
         return query + gate_val * out
@@ -70,11 +85,20 @@ class CrossModalityTransformerBlock(nn.Module):
         self.dim = dim
 
         self.norm1 = nn.LayerNorm(dim)
-        self.self_attn = FlashAttention(
-            hidden_size=dim,
-            num_heads=n_heads,
-            attention_dropout=dropout
-        )
+
+        if FLASH_AVAILABLE:
+            self.self_attn = LlamaFlashAttention2(
+                hidden_size=dim,
+                num_heads=n_heads,
+                attention_dropout=dropout
+            )
+        else:
+            self.self_attn = nn.MultiheadAttention(
+                embed_dim=dim,
+                num_heads=n_heads,
+                dropout=dropout,
+                batch_first=True
+            )
 
         self.cross_attn = NormalizedGatedCrossAttention(
             query_dim=dim,
@@ -97,16 +121,25 @@ class CrossModalityTransformerBlock(nn.Module):
     def forward(self, x, context, self_mask=None, context_mask=None):
         x_norm = self.norm1(x)
 
-        x = x + self.self_attn(
-            hidden_states=x_norm,
-            attention_mask=self_mask,
-            position_ids=None,
-            past_key_value=None,
-            output_attentions=False,
-            use_cache=False
-        )
+        if FLASH_AVAILABLE:
+            attn_output = self.self_attn(
+                hidden_states=x_norm,
+                attention_mask=self_mask,
+                position_ids=None,
+                past_key_value=None,
+                output_attentions=False,
+                use_cache=False
+            )[0]
+        else:
+            attn_output, _ = self.self_attn(
+                query=x_norm,
+                key=x_norm,
+                value=x_norm,
+                key_padding_mask=self_mask if self_mask is not None and self_mask.dim() == 2 else None,
+                attn_mask=None
+            )
 
+        x = x + attn_output
         x = self.cross_attn(x, context, mask=context_mask)
-
         x = x + self.mlp(self.norm2(x))
         return x
