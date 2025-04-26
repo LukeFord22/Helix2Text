@@ -84,7 +84,7 @@ def get_tokenized_dataset(dna_tokenizer, text_tokenizer, config=None):
     
     return tokenized_data
 
-def get_data_loaders(dna_tokenizer, text_tokenizer, config=None):
+def get_data_loaders(dna_tokenizer, text_tokenizer, config=None, rank=None, world_size=None, use_distributed_sampler=False):
     """
     Create DataLoaders for training and testing.
     
@@ -92,6 +92,9 @@ def get_data_loaders(dna_tokenizer, text_tokenizer, config=None):
         dna_tokenizer: Tokenizer for DNA sequences
         text_tokenizer: Tokenizer for text descriptions
         config: Configuration object
+        rank: Process rank in distributed training
+        world_size: Total number of processes in distributed training
+        use_distributed_sampler: Whether to use a DistributedSampler
         
     Returns:
         Tuple of (train_loader, test_loader)
@@ -99,17 +102,58 @@ def get_data_loaders(dna_tokenizer, text_tokenizer, config=None):
     config = config or default_config
     tokenized_data = get_tokenized_dataset(dna_tokenizer, text_tokenizer, config)
     
-    train_loader = DataLoader(
-        tokenized_data['train'], 
-        batch_size=config.training.batch_size, 
-        shuffle=True, 
-        pin_memory=True
-    )
-    
-    test_loader = DataLoader(
-        tokenized_data['test'], 
-        batch_size=config.training.batch_size, 
-        pin_memory=True
-    )
+    # Configure samplers and loaders based on distributed setting
+    if use_distributed_sampler and rank is not None and world_size is not None:
+        from torch.utils.data.distributed import DistributedSampler
+        
+        # Create distributed samplers
+        train_sampler = DistributedSampler(
+            tokenized_data['train'],
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=42
+        )
+        
+        # For test data, we still want to split it across GPUs
+        # but shuffling is not necessary
+        test_sampler = DistributedSampler(
+            tokenized_data['test'],
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+        
+        train_loader = DataLoader(
+            tokenized_data['train'], 
+            batch_size=config.training.batch_size,
+            sampler=train_sampler,  # Use sampler instead of shuffle
+            pin_memory=True,
+            num_workers=2
+        )
+        
+        test_loader = DataLoader(
+            tokenized_data['test'], 
+            batch_size=config.training.batch_size,
+            sampler=test_sampler,  # Use sampler for test data too
+            pin_memory=True,
+            num_workers=2
+        )
+        
+        print(f"Created distributed data loaders for rank {rank}/{world_size}")
+    else:
+        # Standard non-distributed loaders
+        train_loader = DataLoader(
+            tokenized_data['train'], 
+            batch_size=config.training.batch_size, 
+            shuffle=True, 
+            pin_memory=True
+        )
+        
+        test_loader = DataLoader(
+            tokenized_data['test'], 
+            batch_size=config.training.batch_size, 
+            pin_memory=True
+        )
     
     return train_loader, test_loader

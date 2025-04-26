@@ -18,14 +18,14 @@ class TrainingConfig:
     early_stop_patience: int = 3
 
     # Loss weights
-    dna_loss_weight: 0.5     
-    text_loss_weight: 0.5      
-    contrastive_loss_weight: 1 
+    dna_loss_weight: float = 0.5  # Added type annotation and default value
+    text_loss_weight: float = 0.5      
+    contrastive_loss_weight: float = 1 
     
 @dataclass
 class ModelConfig:
     """Model architecture configuration parameters."""
-    dna_model_path: str = "metagene-ai/METAGENE-1-BnB-4Bit"
+    dna_model_path: str = "metagene-ai/METAGENE-1"
     text_model_path: str = "microsoft/biogpt-large-pubmedqa"
     cross_attn_interval: int = 4
     hidden_dim: int = 768
@@ -36,6 +36,16 @@ class DataConfig:
     local_path: str = "protein_to_dna_sequence_descriptions.csv"
     eval_path: str = ""  # Path to evaluation dataset (if empty, split from local_path)
     split_data: bool = True  # Whether to split data from the original file
+
+@dataclass
+class DeepSpeedConfig:
+    """DeepSpeed configuration parameters."""
+    use_deepspeed: bool = False         # Whether to use DeepSpeed for training
+    num_gpus: int = 1                   # Number of GPUs to use for training
+    zero_stage: int = 2                 # ZeRO optimization stage (0, 1, 2, or 3)
+    fp16_enabled: bool = True           # Whether to use mixed precision training
+    offload_optimizer: bool = False     # Whether to offload optimizer states to CPU
+    offload_param: bool = False         # Whether to offload parameters to CPU
     
 @dataclass
 class Config:
@@ -43,6 +53,7 @@ class Config:
     training: TrainingConfig = TrainingConfig()
     model: ModelConfig = ModelConfig()
     data: DataConfig = DataConfig()
+    deepspeed: DeepSpeedConfig = DeepSpeedConfig()
     experiment_name: str = "biogpt-dna-fusion"
     project_name: str = "dna-text-fusion"
     
