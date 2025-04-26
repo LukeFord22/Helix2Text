@@ -40,7 +40,7 @@ OUTPUT_MODEL_PATH = "best_model.pt"  # Where to save the trained model
 NUM_EPOCHS = 1
 BATCH_SIZE = 1
 LEARNING_RATE = 5e-5
-GRAD_ACCUM_STEPS = 8
+GRAD_ACCUM_STEPS = 3  # Reduced from 100 for more frequent updates
 EARLY_STOP_PATIENCE = 3
 
 # Data Splitting Options
@@ -54,8 +54,8 @@ PROJECT_NAME = "Helix2Text"  # Same project name as your other files
 EXPERIMENT_NAME = f"Training-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 # Distributed Training Configuration
-USE_DISTRIBUTED = True  # Set to True to use PyTorch DDP
-NUM_GPUS = 2  # Number of GPUs to use for distributed training
+USE_DISTRIBUTED = True  # Re-enabled with fixed progress visualization
+NUM_GPUS = 4  # Number of GPUs to use for distributed training
 DISTRIBUTED_BACKEND = "nccl"  # Backend for distributed training (nccl is best for CUDA)
 
 # =============================================================================
@@ -145,6 +145,19 @@ def train_process(rank, world_size):
         # Set output model path
         config.output_path = OUTPUT_MODEL_PATH
         
+        # Enable DeepSpeed with ZeRO optimization
+        config.deepspeed.use_deepspeed = True
+        config.deepspeed.zero_stage = 2  # Optimizer state partitioning
+        config.deepspeed.fp16_enabled = True  # Enable mixed precision
+        config.deepspeed.num_gpus = world_size
+        
+        # Offload optimizer states and parameters to CPU
+        config.deepspeed.offload_optimizer = True
+        config.deepspeed.offload_param = True  # More aggressive memory saving
+        
+        if is_main_process:
+            print("DeepSpeed ZeRO-2 enabled with optimizer/parameter offloading and mixed precision")
+        
         # Set random seed for reproducibility (adding rank for process-specific randomness)
         set_seed(42 + rank)
         
@@ -156,14 +169,20 @@ def train_process(rank, world_size):
             "is_main_process": is_main_process
         }
         
-        # Disable wandb for non-main processes
+        # Configure wandb for DDP - disable on non-main processes
+        # Set environment variables before any possible wandb import/init
         if not is_main_process:
+            # Completely disable wandb on non-main processes
             os.environ["WANDB_MODE"] = "disabled"
+            os.environ["WANDB_SILENT"] = "true"
         elif not USE_WANDB:
+            # If wandb is disabled by user config
             os.environ["WANDB_MODE"] = "disabled"
             if is_main_process:
                 print("Weights & Biases tracking disabled")
         else:
+            # Set a unique group ID for this DDP run
+            os.environ["WANDB_RUN_GROUP"] = f"ddp_training_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             if is_main_process:
                 print(f"Weights & Biases tracking enabled for project: {PROJECT_NAME}")
         
@@ -173,6 +192,13 @@ def train_process(rank, world_size):
             text_model_path=config.model.text_model_path,
             device=device
         )
+        
+        # Enable gradient checkpointing in the models to save memory
+        dna_model.gradient_checkpointing_enable()
+        text_model.gradient_checkpointing_enable()
+        
+        if is_main_process:
+            print("Gradient checkpointing enabled to reduce memory usage")
         
         # Create the fusion model
         model = DNATextFusion(
@@ -295,6 +321,18 @@ def main():
         # Set output model path
         config.output_path = OUTPUT_MODEL_PATH
         
+        # Enable DeepSpeed with ZeRO optimization for single GPU training
+        config.deepspeed.use_deepspeed = True
+        config.deepspeed.zero_stage = 2  # Optimizer state partitioning
+        config.deepspeed.fp16_enabled = True  # Enable mixed precision
+        config.deepspeed.num_gpus = 1
+        
+        # Offload optimizer states and parameters to CPU
+        config.deepspeed.offload_optimizer = True
+        config.deepspeed.offload_param = True  # More aggressive memory saving
+        
+        print("DeepSpeed ZeRO-2 enabled with optimizer/parameter offloading and mixed precision")
+        
         # Configure distributed attributes (single-process mode)
         config.distributed = {
             "enabled": False,
@@ -321,7 +359,13 @@ def main():
             device=device
         )
         
+        # Enable gradient checkpointing in the models to save memory
+        dna_model.gradient_checkpointing_enable()
+        text_model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled to reduce memory usage")
+        
         # Create the fusion model
+        print("Loading models...")
         model = DNATextFusion(
             dna_model=dna_model,
             text_model=text_model,

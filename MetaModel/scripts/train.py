@@ -8,8 +8,11 @@ import random
 import numpy as np
 import torch
 from torch.cuda.amp import GradScaler
-from tqdm.auto import tqdm
+from tqdm import tqdm
 import wandb
+import sys
+import io
+from datetime import datetime
 
 # Import from our modular structure
 from ..configs.default_config import Config, default_config
@@ -45,15 +48,61 @@ def load_config(config_path=None):
             return config
     return default_config
 
+def create_ddp_compatible_progress_bar(iterator, desc, is_main_process, local_rank):
+    """
+    Create a progress bar that's compatible with distributed training.
+    Only shows on the main process with proper configuration.
+    
+    Args:
+        iterator: Iterable to track progress over
+        desc: Description for the progress bar
+        is_main_process: Whether this is the main process (rank 0)
+        local_rank: The rank of the current process
+    
+    Returns:
+        A tqdm progress bar or the original iterator
+    """
+    if not is_main_process:
+        return iterator
+    
+    # Create a log file for this specific rank's output
+    # This prevents terminal corruption when multiple processes write simultaneously
+    log_dir = os.path.join(os.getcwd(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Set up tqdm with appropriate settings for DDP
+    progress_bar = tqdm(
+        iterator,
+        desc=desc,
+        ncols=100,
+        leave=True,
+        position=0,  # Main process always has position 0
+        dynamic_ncols=False,
+        disable=False,
+        mininterval=1.0,  # Less frequent updates to prevent output corruption
+        file=sys.stdout,  # Output to stdout for main process
+        smoothing=0.1
+    )
+    
+    # Clear the current line before starting the progress bar (helps with DDP)
+    print("\033[K", end="", flush=True)
+    
+    return progress_bar
+
 def train_model(config=None):
     """Main training function for DNA-Text fusion models."""
     # Load configuration
+    print("Loading configuration...")
     config = config or default_config
     
     # Check which distributed mode we're using
-    using_deepspeed = hasattr(config, 'deepspeed_runtime') and config.deepspeed_runtime is not None
+    using_deepspeed = hasattr(config, 'deepspeed') and config.deepspeed.use_deepspeed
     using_ddp = hasattr(config, 'ddp_runtime') and config.ddp_runtime is not None
     using_distributed = hasattr(config, 'distributed') and config.distributed.get('enabled', False)
+    
+    # Set up DeepSpeed config path
+    deepspeed_config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
+                                         "configs", "ds.config.json")
     
     # Determine device and distributed settings
     if using_deepspeed:
@@ -87,17 +136,33 @@ def train_model(config=None):
     # Set random seed for reproducibility
     set_seed(42 + (local_rank if local_rank >= 0 else 0))
     
-    # Initialize wandb only on main process
-    if is_main_process and not wandb.run:
-        wandb.init(
-            project=config.project_name,
-            name=config.experiment_name,
-            config={
-                "training": vars(config.training),
-                "model": vars(config.model),
-                "data": vars(config.data)
-            }
-        )
+    # Initialize wandb only on main process with DDP-compatible settings
+    if is_main_process:
+        # Create a unique run group ID that can be shared across processes if needed
+        run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+        # Set the WANDB_RUN_GROUP environment variable for potential process coordination
+        os.environ["WANDB_RUN_GROUP"] = f"ddp_training_{run_id}"
+        
+        # Make sure wandb doesn't reinitialize if a run already exists
+        if not wandb.run:
+            wandb.init(
+                project=config.project_name,
+                name=config.experiment_name,
+                config={
+                    "training": vars(config.training),
+                    "model": vars(config.model),
+                    "data": vars(config.data),
+                    "distributed": {
+                        "enabled": using_ddp or using_distributed,
+                        "world_size": config.ddp_runtime.get('world_size', 1) if using_ddp 
+                                    else config.distributed.get('world_size', 1) if using_distributed 
+                                    else 1
+                    }
+                }
+            )
+    else:
+        # For non-main processes, disable wandb completely
+        os.environ["WANDB_MODE"] = "disabled"
     
     # For DeepSpeed, we extract from runtime config
     if using_deepspeed:
@@ -188,6 +253,7 @@ def train_model(config=None):
     epochs_no_improve = 0
     
     # Start training loop
+    print("Starting training...")
     for epoch in range(config.training.num_epochs):
         # Set sampler epoch for distributed training
         if using_ddp and hasattr(train_loader, 'sampler') and hasattr(train_loader.sampler, 'set_epoch'):
@@ -205,11 +271,13 @@ def train_model(config=None):
         step_times = []
         
         # Initialize progress bar (only on main process)
-        if is_main_process:
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.training.num_epochs}")
-        else:
-            progress_bar = train_loader
-            
+        progress_bar = create_ddp_compatible_progress_bar(
+            iterator=train_loader,
+            desc=f"Epoch {epoch+1}/{config.training.num_epochs}",
+            is_main_process=is_main_process,
+            local_rank=local_rank
+        )
+        
         epoch_start_time = time.time()
         
         # Training steps
@@ -306,13 +374,25 @@ def train_model(config=None):
                 if len(step_times) > max_step_times:
                     step_times.pop(0)  # Remove oldest timing
 
-                # Calculate ETA based on recent average
+                # Calculate ETA based on recent average step time
                 avg_step_time = sum(step_times) / len(step_times)
+                
+                # Calculate total steps and remaining steps for the entire training process
+                total_training_steps = config.training.num_epochs * len(train_loader)
+                steps_done = (epoch * len(train_loader)) + step + 1
                 remaining_steps = total_training_steps - steps_done
+                
+                # Calculate ETA for the entire training process
                 eta_seconds = remaining_steps * avg_step_time
                 eta_minutes = eta_seconds / 60
                 eta_hours = eta_minutes / 60
-                    
+                
+                # Format ETA for display
+                if eta_hours > 1:
+                    eta_display = f"{eta_hours:.1f}h"
+                else:
+                    eta_display = f"{eta_minutes:.1f}m"
+
                 # Log step metrics
                 if wandb.run:
                     step_metrics = {
@@ -321,7 +401,9 @@ def train_model(config=None):
                         "Text": text_ce_loss.item(),
                         **contrastive_metrics,
                         "step": steps_done,
-                        "eta_min": eta_minutes
+                        "eta_min": eta_minutes,
+                        "total_progress": steps_done / total_training_steps,
+                        "progress_percent": (steps_done / total_training_steps) * 100
                     }
                     
                     # Add learning rate if available
@@ -334,13 +416,18 @@ def train_model(config=None):
                     wandb.log(step_metrics)
                 
                 # Update progress bar
+                # Add indicator for gradient accumulation progress
+                accum_step = (step % config.training.grad_accum_steps) + 1
+                accum_percent = accum_step / config.training.grad_accum_steps * 100
+                
                 progress_bar.set_postfix({
-                    "Loss": loss.item(),
-                    "DNA": dna_ce_loss.item(),
-                    "Text": text_ce_loss.item(),
-                    "Cont": contrastive_loss.item(),
-                    "temp": contrastive_metrics["contrastive_temperature"],
-                    "eta_min": eta_minutes
+                    "Loss": f"{loss.item():.4f}",
+                    "DNA": f"{dna_ce_loss.item():.4f}",
+                    "Text": f"{text_ce_loss.item():.4f}",
+                    "Cont": f"{contrastive_loss.item():.4f}",
+                    "Accum": f"{accum_step}/{config.training.grad_accum_steps} ({accum_percent:.0f}%)",
+                    "ETA": eta_display,
+                    "Progress": f"{steps_done}/{total_training_steps} ({(steps_done/total_training_steps)*100:.1f}%)"
                 })
         
         # Calculate epoch metrics

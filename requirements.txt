@@ -16,4 +16,3 @@ pyyaml>=6.0.0
 tokenizers>=0.13.0
 sacremoses>=0.0.53
 deepspeed>=0.5.10
-mpi4py>=3.0.3
