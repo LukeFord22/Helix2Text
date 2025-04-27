@@ -1,16 +1,58 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.models.llama.modeling_llama import LlamaFlashAttention2
 
-try:
-    from transformers.models.llama.modeling_llama import LlamaFlashAttention2
-    FLASH_AVAILABLE = True
-except ImportError:
-    FLASH_AVAILABLE = False
+
+class MQAFlashAttention(nn.Module):
+    """Multi-Query Attention block with Flash-style speedup."""
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        # Separate projections for queries
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # SHARED projections for keys/values (only ONE key, ONE value per position)
+        self.k_proj = nn.Linear(embed_dim, self.head_dim, bias=False)
+        self.v_proj = nn.Linear(embed_dim, self.head_dim, bias=False)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key, value, mask=None):
+        B, Lq, _ = query.shape
+        _, Lk, _ = key.shape
+
+        q = self.q_proj(query)  # (B, Lq, H*D)
+        k = self.k_proj(key)    # (B, Lk, D)
+        v = self.v_proj(value)  # (B, Lk, D)
+
+        # Reshape queries for multihead
+        q = q.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, Lq, D)
+
+        # Expand k/v to match heads
+        k = k.unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # (B, H, Lk, D)
+        v = v.unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # (B, H, Lk, D)
+
+        attn_scores = (q @ k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (B, H, Lq, Lk)
+
+        if mask is not None:
+            attn_scores = attn_scores.masked_fill(mask.unsqueeze(1) == 0, float('-inf'))
+
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+
+        attn_output = attn_probs @ v  # (B, H, Lq, D)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(B, Lq, self.embed_dim)
+
+        return self.out_proj(attn_output)
 
 
 class NormalizedGatedCrossAttention(nn.Module):
-    """Highly optimized cross-attention block with layernorm, projection, gating."""
+    """Highly optimized cross-attention block with LayerNorm, projection, MQA, gating."""
     def __init__(self, query_dim, context_dim=None, n_heads=8, dropout=0.0):
         super().__init__()
         self.query_dim = query_dim
@@ -25,20 +67,13 @@ class NormalizedGatedCrossAttention(nn.Module):
         else:
             self.context_proj = nn.Identity()
 
-        if FLASH_AVAILABLE:
-            self.cross_attn = LlamaFlashAttention2(
-                hidden_size=query_dim,
-                num_heads=n_heads,
-                attention_dropout=dropout
-            )
-        else:
-            self.cross_attn = nn.MultiheadAttention(
-                embed_dim=query_dim,
-                num_heads=n_heads,
-                dropout=dropout,
-                batch_first=True
-            )
-            
+        # Always use MQA
+        self.cross_attn = MQAFlashAttention(
+            embed_dim=query_dim,
+            num_heads=n_heads,
+            dropout=dropout
+        )
+        
         self.gate = nn.Sequential(
             nn.Linear(query_dim * 2, query_dim),
             nn.Sigmoid()
@@ -49,34 +84,16 @@ class NormalizedGatedCrossAttention(nn.Module):
         k = self.norm_context(context)
         k = self.context_proj(k)
 
-        attn_mask = None
-        if mask is not None:
-            if mask.dim() == 2:
-                attn_mask = mask[:, None, None, :]
-            elif mask.dim() == 3 and mask.size(1) == 1:
-                attn_mask = mask.unsqueeze(1)
-            if attn_mask is not None and attn_mask.dtype == torch.bool:
-                attn_mask = attn_mask.float()
-
-        if FLASH_AVAILABLE:
-            out = self.cross_attn(
-                hidden_states=q,
-                encoder_hidden_states=k,
-                attention_mask=attn_mask,
-                output_attentions=False,
-                use_cache=False
-            )[0]
-        else:
-            out, _ = self.cross_attn(
-                query=q,
-                key=k,
-                value=k,
-                key_padding_mask=mask if mask is not None and mask.dim() == 2 else None,
-                attn_mask=None
-            )
+        out = self.cross_attn(
+            query=q,
+            key=k,
+            value=k,
+            mask=mask
+        )
 
         gate_val = self.gate(torch.cat([q, out], dim=-1))
         return query + gate_val * out
+
 
 class CrossModalityTransformerBlock(nn.Module):
     """Transformer block with Flash Self-Attention + Cross-Attention."""
@@ -86,19 +103,11 @@ class CrossModalityTransformerBlock(nn.Module):
 
         self.norm1 = nn.LayerNorm(dim)
 
-        if FLASH_AVAILABLE:
-            self.self_attn = LlamaFlashAttention2(
-                hidden_size=dim,
-                num_heads=n_heads,
-                attention_dropout=dropout
-            )
-        else:
-            self.self_attn = nn.MultiheadAttention(
-                embed_dim=dim,
-                num_heads=n_heads,
-                dropout=dropout,
-                batch_first=True
-            )
+        self.self_attn = LlamaFlashAttention2(
+            hidden_size=dim,
+            num_heads=n_heads,
+            attention_dropout=dropout
+        )
 
         self.cross_attn = NormalizedGatedCrossAttention(
             query_dim=dim,
@@ -111,9 +120,8 @@ class CrossModalityTransformerBlock(nn.Module):
 
         ff_hidden = int(dim * ff_expansion)
         self.mlp = nn.Sequential(
-            nn.Linear(dim, ff_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Linear(dim, ff_hidden * 2),
+            nn.SiLU(),
             nn.Linear(ff_hidden, dim),
             nn.Dropout(dropout)
         )
@@ -121,23 +129,15 @@ class CrossModalityTransformerBlock(nn.Module):
     def forward(self, x, context, self_mask=None, context_mask=None):
         x_norm = self.norm1(x)
 
-        if FLASH_AVAILABLE:
-            attn_output = self.self_attn(
-                hidden_states=x_norm,
-                attention_mask=self_mask,
-                position_ids=None,
-                past_key_value=None,
-                output_attentions=False,
-                use_cache=False
-            )[0]
-        else:
-            attn_output, _ = self.self_attn(
-                query=x_norm,
-                key=x_norm,
-                value=x_norm,
-                key_padding_mask=self_mask if self_mask is not None and self_mask.dim() == 2 else None,
-                attn_mask=None
-            )
+        attn_output = self.self_attn(
+            hidden_states=x_norm,
+            attention_mask=self_mask,
+            position_ids=None,
+            past_key_value=None,
+            output_attentions=False,
+            use_cache=False
+        )[0]
+
 
         x = x + attn_output
         x = self.cross_attn(x, context, mask=context_mask)

@@ -27,7 +27,7 @@ class LearnableFusionBlock(nn.Module):
         # Fusion layer
         self.fusion = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim, bias=False),
-            nn.GELU(),
+            nn.SiLU(),
             nn.LayerNorm(hidden_dim, eps=1e-5)
         )
     
