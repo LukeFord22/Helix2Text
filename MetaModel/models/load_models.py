@@ -6,7 +6,6 @@ import deepspeed
 from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM
 
-
 from ..data.dataset import get_data_loaders
 from ..models.dna_text_fusion import DNATextFusion
 from ..training.optimization import create_optimizer_and_scheduler
@@ -51,7 +50,6 @@ def load_models(dna_model_path, text_model_path):
         trust_remote_code=True,
         low_cpu_mem_usage=True,
         device_map=None,
-        attn_implementation="flash_attention_2",
     )
     
     # Enable gradient checkpointing immediately after loading
@@ -85,10 +83,8 @@ def setup_fusion_and_deepspeed(rank, world_size, config):
     torch.cuda.empty_cache()
     print(f"[Rank {rank}] Model fusion complete. Allocated CPU RAM: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
 
-
-    # create the loaders
     train_loader, test_loader = get_data_loaders(
-    dna_tokenizer, text_tokenizer, 
+    dna_tokenizer, text_tokenizer, config,
     rank=rank, world_size=world_size
     )
 
@@ -102,9 +98,9 @@ def setup_fusion_and_deepspeed(rank, world_size, config):
     )
 
     # Assume config is your TrainingConfig instance
-    DS_CONFIG["train_batch_size"] = config.batch_size
-    DS_CONFIG["train_micro_batch_size_per_gpu"] = config.batch_size // config.grad_accum_steps
-    DS_CONFIG["gradient_accumulation_steps"] = config.grad_accum_steps
+    DS_CONFIG["train_batch_size"] = max(int(config.training.batch_size), world_size)  # Must be >= world_size
+    DS_CONFIG["gradient_accumulation_steps"] = int(config.training.grad_accum_steps)
+
 
     # DeepSpeed initialization
     model_engine, _, _, _ = deepspeed.initialize(
@@ -113,8 +109,6 @@ def setup_fusion_and_deepspeed(rank, world_size, config):
         optimizer=optimizer,
         lr_scheduler=scheduler,
         config=DS_CONFIG,
-        custom_dataloader=train_loader,      
-        custom_eval_dataloader=test_loader    
     )
 
     print(f"[Rank {rank}] After DeepSpeed init: GPU memory {torch.cuda.memory_allocated() / 1e9:.2f} GB")

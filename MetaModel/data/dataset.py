@@ -55,6 +55,8 @@ class StreamingTokenizedDataset(IterableDataset):
                 "text_input_ids": text_enc.input_ids.squeeze(0),
                 "text_attention_mask": text_enc.attention_mask.squeeze(0)
             }
+    def __len__(self):
+        return len(self.data)
 
 def get_data_loaders(dna_tokenizer, text_tokenizer, config, rank=None, world_size=None):
     df = pd.read_csv(config.data.local_path)
@@ -69,21 +71,21 @@ def get_data_loaders(dna_tokenizer, text_tokenizer, config, rank=None, world_siz
     train_dataset = StreamingTokenizedDataset(train_df, dna_tokenizer, text_tokenizer, config, split="train")
     test_dataset = StreamingTokenizedDataset(test_df, dna_tokenizer, text_tokenizer, config, split="test")
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(
-        train_dataset, num_replicas=world_size, rank=rank, shuffle=True
-    )
-    test_sampler = torch.utils.data.distributed.DistributedSampler(
-        test_dataset, num_replicas=world_size, rank=rank, shuffle=False
-    )
-
+    # No samplers anymore 
     train_loader = DataLoader(
-        train_dataset, batch_size=config.training.batch_size,
-        sampler=train_sampler, shuffle=False, pin_memory=True, num_workers=2
+        train_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=False,         # You CANNOT shuffle an IterableDataset
+        pin_memory=True,
+        num_workers=2,
     )
 
     test_loader = DataLoader(
-        test_dataset, batch_size=config.training.batch_size,
-        sampler=test_sampler, shuffle=False, pin_memory=True, num_workers=2
+        test_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=False,
+        pin_memory=True,
+        num_workers=2,
     )
 
     return train_loader, test_loader

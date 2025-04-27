@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.models.llama.modeling_llama import LlamaFlashAttention2
-
 
 class MQAFlashAttention(nn.Module):
     """Multi-Query Attention block with Flash-style speedup."""
@@ -103,10 +101,11 @@ class CrossModalityTransformerBlock(nn.Module):
 
         self.norm1 = nn.LayerNorm(dim)
 
-        self.self_attn = LlamaFlashAttention2(
-            hidden_size=dim,
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=dim,
             num_heads=n_heads,
-            attention_dropout=dropout
+            dropout=dropout,
+            batch_first=True
         )
 
         self.cross_attn = NormalizedGatedCrossAttention(

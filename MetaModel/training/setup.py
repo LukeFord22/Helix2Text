@@ -17,8 +17,8 @@ def setup_training(config):
     scheduler = model_engine.lr_scheduler
 
     # Fetch data from model_engine
-    train_loader = model_engine.train_dataloader
-    test_loader = model_engine.eval_dataloader
+    train_loader = config.deepspeed_runtime['train_loader']
+    test_loader = config.deepspeed_runtime['test_loader']
 
     return model_engine, optimizer, scheduler, train_loader, test_loader, device, local_rank, dna_tokenizer, text_tokenizer
 

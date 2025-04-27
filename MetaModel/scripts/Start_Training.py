@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(parent_dir)
 
+from MetaModel.data.dataset import get_data_loaders
 from MetaModel.configs.default_config import default_config
 from MetaModel.training.train import train_model
 from MetaModel.models.load_models import setup_fusion_and_deepspeed
@@ -55,7 +56,12 @@ def cleanup():
 
 def train_process(rank, world_size):
     """Main training loop for a single rank."""
+
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["NCCL_DEBUG"] = "WARN"
+    
     try:
+
         setup(rank, world_size)
 
         device = torch.device(f"cuda:{rank}")
@@ -68,6 +74,11 @@ def train_process(rank, world_size):
         print(f"[{rank}] Loading models...")
         model_engine, dna_tokenizer, text_tokenizer = setup_fusion_and_deepspeed(rank, world_size, config)
 
+        train_loader, test_loader = get_data_loaders(
+        dna_tokenizer, text_tokenizer, config,
+        rank=rank, world_size=world_size
+        )
+
         # Update config runtime references
         config.deepspeed_runtime = {
             "model_engine": model_engine,
@@ -75,7 +86,9 @@ def train_process(rank, world_size):
             "rank": rank,
             "world_size": world_size,
             "dna_tokenizer": dna_tokenizer,
-            "text_tokenizer": text_tokenizer
+            "text_tokenizer": text_tokenizer,
+            "train_loader": train_loader,  # Add this!
+            "test_loader": test_loader     # Add this!
         }
         
         print(f"[{rank}] Starting training: {config.training.num_epochs} epochs")

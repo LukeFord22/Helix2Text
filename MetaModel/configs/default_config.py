@@ -7,11 +7,11 @@ import os
 @dataclass
 class TrainingConfig:
     """Training configuration parameters."""
-    batch_size: int = 1
+    batch_size: int = 8
     num_epochs: int = 1
     learning_rate: float = 5e-5
     max_seq_length: int = 512
-    grad_accum_steps: int = 3
+    grad_accum_steps: int = 2
     train_data_fraction: float = 1.0
     train_split_fraction: float = 0.9  # Default: 90% for training, 10% for evaluation
     semantic_loss_weight: float = 0.5
